@@ -6,6 +6,10 @@
 #include "usbh_core.h"
 #include "usbh_video.h"
 
+#undef USB_DBG_TAG
+#define USB_DBG_TAG "usbh_video"
+#include "usb_log.h"
+
 #define DEV_FORMAT "/dev/video%d"
 
 /* general descriptor field offsets */
@@ -30,11 +34,11 @@ static uint32_t g_devinuse = 0;
 
 static struct usbh_video *usbh_video_class_alloc(void)
 {
-    int devno;
+    uint8_t devno;
 
     for (devno = 0; devno < CONFIG_USBHOST_MAX_VIDEO_CLASS; devno++) {
-        if ((g_devinuse & (1 << devno)) == 0) {
-            g_devinuse |= (1 << devno);
+        if ((g_devinuse & (1U << devno)) == 0) {
+            g_devinuse |= (1U << devno);
             memset(&g_video_class[devno], 0, sizeof(struct usbh_video));
             g_video_class[devno].minor = devno;
             return &g_video_class[devno];
@@ -45,19 +49,24 @@ static struct usbh_video *usbh_video_class_alloc(void)
 
 static void usbh_video_class_free(struct usbh_video *video_class)
 {
-    int devno = video_class->minor;
+    uint8_t devno = video_class->minor;
 
-    if (devno >= 0 && devno < 32) {
-        g_devinuse &= ~(1 << devno);
+    if (devno < 32) {
+        g_devinuse &= ~(1U << devno);
     }
     memset(video_class, 0, sizeof(struct usbh_video));
 }
 
 int usbh_video_get(struct usbh_video *video_class, uint8_t request, uint8_t intf, uint8_t entity_id, uint8_t cs, uint8_t *buf, uint16_t len)
 {
-    struct usb_setup_packet *setup = video_class->hport->setup;
+    struct usb_setup_packet *setup;
     int ret;
     uint8_t retry;
+
+    if (!video_class || !video_class->hport) {
+        return -USB_ERR_INVAL;
+    }
+    setup = video_class->hport->setup;
 
     setup->bmRequestType = USB_REQUEST_DIR_IN | USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_INTERFACE;
     setup->bRequest = request;
@@ -87,8 +96,13 @@ int usbh_video_get(struct usbh_video *video_class, uint8_t request, uint8_t intf
 
 int usbh_video_set(struct usbh_video *video_class, uint8_t request, uint8_t intf, uint8_t entity_id, uint8_t cs, uint8_t *buf, uint16_t len)
 {
-    struct usb_setup_packet *setup = video_class->hport->setup;
+    struct usb_setup_packet *setup;
     int ret;
+
+    if (!video_class || !video_class->hport) {
+        return -USB_ERR_INVAL;
+    }
+    setup = video_class->hport->setup;
 
     setup->bmRequestType = USB_REQUEST_DIR_OUT | USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_INTERFACE;
     setup->bRequest = request;
@@ -132,7 +146,7 @@ int usbh_video_open(struct usbh_video *video_class,
                     uint16_t wHeight,
                     uint8_t altsetting)
 {
-    struct usb_setup_packet *setup = video_class->hport->setup;
+    struct usb_setup_packet *setup;
     struct usb_endpoint_descriptor *ep_desc;
     uint8_t mult;
     uint16_t mps;
@@ -141,6 +155,11 @@ int usbh_video_open(struct usbh_video *video_class,
     uint8_t formatidx = 0;
     uint8_t frameidx = 0;
     uint8_t step;
+
+    if (!video_class || !video_class->hport) {
+        return -USB_ERR_INVAL;
+    }
+    setup = video_class->hport->setup;
 
     if (video_class->is_opened) {
         return 0;
@@ -176,7 +195,7 @@ int usbh_video_open(struct usbh_video *video_class,
      * Get MIN request (probe)
      * Get CUR request (probe)
      * Set CUR request (commit)
-     *    
+     *
     */
     step = 0;
     ret = usbh_videostreaming_get_cur_probe(video_class);
@@ -261,8 +280,13 @@ errout:
 
 int usbh_video_close(struct usbh_video *video_class)
 {
-    struct usb_setup_packet *setup = video_class->hport->setup;
+    struct usb_setup_packet *setup;
     int ret = 0;
+
+    if (!video_class || !video_class->hport) {
+        return -USB_ERR_INVAL;
+    }
+    setup = video_class->hport->setup;
 
     USB_LOG_INFO("Close video device\r\n");
 
@@ -296,12 +320,12 @@ void usbh_video_list_info(struct usbh_video *video_class)
     uint16_t mps;
 
     USB_LOG_INFO("============= Video device information ===================\r\n");
-    USB_LOG_INFO("bcdVDC:%04x\r\n", video_class->bcdVDC);
-    USB_LOG_INFO("Num of altsettings:%u\r\n", video_class->num_of_intf_altsettings);
+    USB_LOG_RAW("bcdVDC:%04x\r\n", video_class->bcdVDC);
+    USB_LOG_RAW("Num of altsettings:%u\r\n", video_class->num_of_intf_altsettings);
 
     for (uint8_t i = 0; i < video_class->num_of_intf_altsettings; i++) {
         if (i == 0) {
-            USB_LOG_INFO("Ingore altsetting 0\r\n");
+            USB_LOG_RAW("Ingore altsetting 0\r\n");
             continue;
         }
         ep_desc = &video_class->hport->config.intf[video_class->data_intf].altsetting[i].ep[0].ep_desc;
@@ -309,7 +333,7 @@ void usbh_video_list_info(struct usbh_video *video_class)
         mult = (ep_desc->wMaxPacketSize & USB_MAXPACKETSIZE_ADDITIONAL_TRANSCATION_MASK) >> USB_MAXPACKETSIZE_ADDITIONAL_TRANSCATION_SHIFT;
         mps = ep_desc->wMaxPacketSize & USB_MAXPACKETSIZE_MASK;
 
-        USB_LOG_INFO("Altsetting:%u, Ep=%02x Attr=%02u Mps=%d Interval=%02u Mult=%02u\r\n",
+        USB_LOG_RAW("Altsetting:%u, Ep=%02x Attr=%02u Mps=%d Interval=%02u Mult=%02u\r\n",
                      i,
                      ep_desc->bEndpointAddress,
                      ep_desc->bmAttributes,
@@ -318,15 +342,15 @@ void usbh_video_list_info(struct usbh_video *video_class)
                      mult);
     }
 
-    USB_LOG_INFO("bNumFormats:%u\r\n", video_class->num_of_formats);
+    USB_LOG_RAW("bNumFormats:%u\r\n", video_class->num_of_formats);
     for (uint8_t i = 0; i < video_class->num_of_formats; i++) {
-        USB_LOG_INFO("  FormatIndex:%u\r\n", i + 1);
-        USB_LOG_INFO("  FormatType:%s\r\n", format_type[video_class->format[i].format_type]);
-        USB_LOG_INFO("  bNumFrames:%u\r\n", video_class->format[i].num_of_frames);
-        USB_LOG_INFO("  Resolution:\r\n");
+        USB_LOG_RAW("  FormatIndex:%u\r\n", i + 1);
+        USB_LOG_RAW("  FormatType:%s\r\n", format_type[video_class->format[i].format_type]);
+        USB_LOG_RAW("  bNumFrames:%u\r\n", video_class->format[i].num_of_frames);
+        USB_LOG_RAW("  Resolution:\r\n");
         for (uint8_t j = 0; j < video_class->format[i].num_of_frames; j++) {
-            USB_LOG_INFO("      FrameIndex:%u\r\n", j + 1);
-            USB_LOG_INFO("      wWidth: %d, wHeight: %d\r\n",
+            USB_LOG_RAW("      FrameIndex:%u\r\n", j + 1);
+            USB_LOG_RAW("      wWidth: %d, wHeight: %d\r\n",
                          video_class->format[i].frame[j].wWidth,
                          video_class->format[i].frame[j].wHeight);
         }
@@ -471,20 +495,26 @@ static int usbh_video_ctrl_disconnect(struct usbh_hubport *hport, uint8_t intf)
 
 static int usbh_video_streaming_connect(struct usbh_hubport *hport, uint8_t intf)
 {
+    (void)hport;
+    (void)intf;
     return 0;
 }
 
 static int usbh_video_streaming_disconnect(struct usbh_hubport *hport, uint8_t intf)
 {
+    (void)hport;
+    (void)intf;
     return 0;
 }
 
 __WEAK void usbh_video_run(struct usbh_video *video_class)
 {
+    (void)video_class;
 }
 
 __WEAK void usbh_video_stop(struct usbh_video *video_class)
 {
+    (void)video_class;
 }
 
 const struct usbh_class_driver video_ctrl_class_driver = {
@@ -501,20 +531,18 @@ const struct usbh_class_driver video_streaming_class_driver = {
 
 CLASS_INFO_DEFINE const struct usbh_class_info video_ctrl_class_info = {
     .match_flags = USB_CLASS_MATCH_INTF_CLASS | USB_CLASS_MATCH_INTF_SUBCLASS | USB_CLASS_MATCH_INTF_PROTOCOL,
-    .class = USB_DEVICE_CLASS_VIDEO,
-    .subclass = VIDEO_SC_VIDEOCONTROL,
-    .protocol = VIDEO_PC_PROTOCOL_UNDEFINED,
-    .vid = 0x00,
-    .pid = 0x00,
+    .bInterfaceClass = USB_DEVICE_CLASS_VIDEO,
+    .bInterfaceSubClass = VIDEO_SC_VIDEOCONTROL,
+    .bInterfaceProtocol = VIDEO_PC_PROTOCOL_UNDEFINED,
+    .id_table = NULL,
     .class_driver = &video_ctrl_class_driver
 };
 
 CLASS_INFO_DEFINE const struct usbh_class_info video_streaming_class_info = {
     .match_flags = USB_CLASS_MATCH_INTF_CLASS | USB_CLASS_MATCH_INTF_SUBCLASS | USB_CLASS_MATCH_INTF_PROTOCOL,
-    .class = USB_DEVICE_CLASS_VIDEO,
-    .subclass = VIDEO_SC_VIDEOSTREAMING,
-    .protocol = VIDEO_PC_PROTOCOL_UNDEFINED,
-    .vid = 0x00,
-    .pid = 0x00,
+    .bInterfaceClass = USB_DEVICE_CLASS_VIDEO,
+    .bInterfaceSubClass = VIDEO_SC_VIDEOSTREAMING,
+    .bInterfaceProtocol = VIDEO_PC_PROTOCOL_UNDEFINED,
+    .id_table = NULL,
     .class_driver = &video_streaming_class_driver
 };

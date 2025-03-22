@@ -14,6 +14,8 @@ extern "C" {
 
 typedef void (*usbh_complete_callback_t)(void *arg, int nbytes);
 
+struct usbh_bus;
+
 /**
  * @brief USB Iso Configuration.
  *
@@ -32,10 +34,12 @@ struct usbh_iso_frame_packet {
  * Structure containing the USB Urb configuration.
  */
 struct usbh_urb {
+    usb_slist_t list;
     void *hcpriv;
     struct usbh_hubport *hport;
     struct usb_endpoint_descriptor *ep;
     uint8_t data_toggle;
+    uint8_t interval;
     struct usb_setup_packet *setup;
     uint8_t *transfer_buffer;
     uint32_t transfer_buffer_length;
@@ -59,21 +63,21 @@ struct usbh_urb {
  *
  * @return On success will return 0, and others indicate fail.
  */
-int usb_hc_init(void);
+int usb_hc_init(struct usbh_bus *bus);
 
 /**
  * @brief usb host controller hardware deinit.
  *
  * @return On success will return 0, and others indicate fail.
  */
-int usb_hc_deinit(void);
+int usb_hc_deinit(struct usbh_bus *bus);
 
 /**
  * @brief Get frame number.
  *
  * @return frame number.
  */
-uint16_t usbh_get_frame_number(void);
+uint16_t usbh_get_frame_number(struct usbh_bus *bus);
 /**
  * @brief control roothub.
  *
@@ -81,7 +85,7 @@ uint16_t usbh_get_frame_number(void);
  * @param buf buf for reading response or write data.
  * @return On success will return 0, and others indicate fail.
  */
-int usbh_roothub_control(struct usb_setup_packet *setup, uint8_t *buf);
+int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup, uint8_t *buf);
 
 /**
  * @brief Submit a usb transfer request to an endpoint.
@@ -103,6 +107,9 @@ int usbh_submit_urb(struct usbh_urb *urb);
  * @return  On success will return 0, and others indicate fail.
  */
 int usbh_kill_urb(struct usbh_urb *urb);
+
+/* called by user */
+void USBH_IRQHandler(uint8_t busid);
 
 #ifdef __cplusplus
 }
