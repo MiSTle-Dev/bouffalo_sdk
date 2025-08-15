@@ -1,10 +1,14 @@
 /*
- * Copyright (c) 2022, sakumisu
+ * Copyright (c) 2024, sakumisu
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "usbh_core.h"
 #include "usbh_cdc_ecm.h"
+
+#undef USB_DBG_TAG
+#define USB_DBG_TAG "usbh_cdc_ecm"
+#include "usb_log.h"
 
 #define DEV_FORMAT "/dev/cdc_ether"
 
@@ -17,18 +21,23 @@
 #define INTF_DESC_bInterfaceNumber  2 /** Interface number offset */
 #define INTF_DESC_bAlternateSetting 3 /** Alternate setting offset */
 
-#define CONFIG_USBHOST_CDC_ECM_PKT_FILTER     0x000C
-#define CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE 1514U
+#define CONFIG_USBHOST_CDC_ECM_PKT_FILTER   0x000C
+#define CONFIG_USBHOST_CDC_ECM_ETH_MAX_SIZE 1514U
 
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_rx_buffer[CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE];
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_tx_buffer[CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE];
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_inttx_buffer[16];
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_rx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_CDC_ECM_ETH_MAX_SIZE, CONFIG_USB_ALIGN_SIZE)];
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_tx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_CDC_ECM_ETH_MAX_SIZE, CONFIG_USB_ALIGN_SIZE)];
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_inttx_buffer[USB_ALIGN_UP(16, CONFIG_USB_ALIGN_SIZE)];
 
 static struct usbh_cdc_ecm g_cdc_ecm_class;
 
 static int usbh_cdc_ecm_set_eth_packet_filter(struct usbh_cdc_ecm *cdc_ecm_class, uint16_t filter_value)
 {
-    struct usb_setup_packet *setup = cdc_ecm_class->hport->setup;
+    struct usb_setup_packet *setup;
+
+    if (!cdc_ecm_class || !cdc_ecm_class->hport) {
+        return -USB_ERR_INVAL;
+    }
+    setup = cdc_ecm_class->hport->setup;
 
     setup->bmRequestType = USB_REQUEST_DIR_OUT | USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_INTERFACE;
     setup->bRequest = CDC_REQUEST_SET_ETHERNET_PACKET_FILTER;
@@ -39,7 +48,7 @@ static int usbh_cdc_ecm_set_eth_packet_filter(struct usbh_cdc_ecm *cdc_ecm_class
     return usbh_control_transfer(cdc_ecm_class->hport, setup, NULL);
 }
 
-int usbh_cdc_ecm_get_notification(struct usbh_cdc_ecm *cdc_ecm_class)
+int usbh_cdc_ecm_get_connect_status(struct usbh_cdc_ecm *cdc_ecm_class)
 {
     int ret;
 
@@ -112,7 +121,7 @@ get_mac:
     }
 
     memset(mac_buffer, 0, 12);
-    ret = usbh_get_string_desc(cdc_ecm_class->hport, mac_str_idx, (uint8_t *)mac_buffer);
+    ret = usbh_get_string_desc(cdc_ecm_class->hport, mac_str_idx, (uint8_t *)mac_buffer, 12);
     if (ret < 0) {
         return ret;
     }
@@ -135,8 +144,8 @@ get_mac:
                  cdc_ecm_class->mac[4],
                  cdc_ecm_class->mac[5]);
 
-    if (cdc_ecm_class->max_segment_size > CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE) {
-        USB_LOG_ERR("CDC ECM Max Segment Size is overflow, default is %u, but now %u\r\n", CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE, cdc_ecm_class->max_segment_size);
+    if (cdc_ecm_class->max_segment_size > CONFIG_USBHOST_CDC_ECM_ETH_MAX_SIZE) {
+        USB_LOG_ERR("CDC ECM Max Segment Size is overflow, default is %u, but now %u\r\n", CONFIG_USBHOST_CDC_ECM_ETH_MAX_SIZE, cdc_ecm_class->max_segment_size);
     } else {
         USB_LOG_INFO("CDC ECM Max Segment Size:%u\r\n", cdc_ecm_class->max_segment_size);
     }
@@ -172,7 +181,7 @@ get_mac:
         }
     }
 
-    /* bit0 Promiscuous 
+    /* bit0 Promiscuous
     * bit1 ALL Multicast
     * bit2 Directed
     * bit3 Broadcast
@@ -184,7 +193,7 @@ get_mac:
     }
     USB_LOG_INFO("Set CDC ECM packet filter:%04x\r\n", CONFIG_USBHOST_CDC_ECM_PKT_FILTER);
 
-    memcpy(hport->config.intf[intf].devname, DEV_FORMAT, CONFIG_USBHOST_DEV_NAMELEN);
+    strncpy(hport->config.intf[intf].devname, DEV_FORMAT, CONFIG_USBHOST_DEV_NAMELEN);
 
     USB_LOG_INFO("Register CDC ECM Class:%s\r\n", hport->config.intf[intf].devname);
 
@@ -212,6 +221,7 @@ static int usbh_cdc_ecm_disconnect(struct usbh_hubport *hport, uint8_t intf)
         }
 
         if (hport->config.intf[intf].devname[0] != '\0') {
+            usb_osal_thread_schedule_other();
             USB_LOG_INFO("Unregister CDC ECM Class:%s\r\n", hport->config.intf[intf].devname);
             usbh_cdc_ecm_stop(cdc_ecm_class);
         }
@@ -222,14 +232,12 @@ static int usbh_cdc_ecm_disconnect(struct usbh_hubport *hport, uint8_t intf)
     return ret;
 }
 
-void usbh_cdc_ecm_rx_thread(void *argument)
+void usbh_cdc_ecm_rx_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV)
 {
     uint32_t g_cdc_ecm_rx_length;
     int ret;
-    err_t err;
-    struct pbuf *p;
-    struct netif *netif = (struct netif *)argument;
 
+    (void)CONFIG_USB_OSAL_THREAD_GET_ARGV;
     USB_LOG_INFO("Create cdc ecm rx thread\r\n");
     // clang-format off
 find_class:
@@ -240,40 +248,38 @@ find_class:
     }
 
     while (g_cdc_ecm_class.connect_status == false) {
-        ret = usbh_cdc_ecm_get_notification(&g_cdc_ecm_class);
+        ret = usbh_cdc_ecm_get_connect_status(&g_cdc_ecm_class);
         if (ret < 0) {
             usb_osal_msleep(100);
             goto find_class;
         }
+        usb_osal_msleep(128);
     }
 
     g_cdc_ecm_rx_length = 0;
     while (1) {
-        usbh_bulk_urb_fill(&g_cdc_ecm_class.bulkin_urb, g_cdc_ecm_class.hport, g_cdc_ecm_class.bulkin, &g_cdc_ecm_rx_buffer[g_cdc_ecm_rx_length], USB_GET_MAXPACKETSIZE(g_cdc_ecm_class.bulkin->wMaxPacketSize), USB_OSAL_WAITING_FOREVER, NULL, NULL);
+        usbh_bulk_urb_fill(&g_cdc_ecm_class.bulkin_urb, g_cdc_ecm_class.hport, g_cdc_ecm_class.bulkin, g_cdc_ecm_rx_buffer, CONFIG_USBHOST_CDC_ECM_ETH_MAX_SIZE, USB_OSAL_WAITING_FOREVER, NULL, NULL);
         ret = usbh_submit_urb(&g_cdc_ecm_class.bulkin_urb);
         if (ret < 0) {
             goto find_class;
         }
 
-        g_cdc_ecm_rx_length += g_cdc_ecm_class.bulkin_urb.actual_length;
+        g_cdc_ecm_rx_length = g_cdc_ecm_class.bulkin_urb.actual_length;
 
-        if (g_cdc_ecm_class.bulkin_urb.actual_length != USB_GET_MAXPACKETSIZE(g_cdc_ecm_class.bulkin->wMaxPacketSize)) {
+        /* A transfer is complete because last packet is a short packet.
+         * Short packet is not zero, match g_cdc_ecm_rx_length % USB_GET_MAXPACKETSIZE(g_cdc_ecm_class.bulkin->wMaxPacketSize).
+         * Short packet is zero, check if g_cdc_ecm_class.bulkin_urb.actual_length < transfer_size, for example transfer is complete with size is 512 < 1514.
+         * This case is always true
+        */
+        if (g_cdc_ecm_rx_length % USB_GET_MAXPACKETSIZE(g_cdc_ecm_class.bulkin->wMaxPacketSize) ||
+            (g_cdc_ecm_class.bulkin_urb.actual_length < CONFIG_USBHOST_CDC_ECM_ETH_MAX_SIZE)) {
             USB_LOG_DBG("rxlen:%d\r\n", g_cdc_ecm_rx_length);
 
-            p = pbuf_alloc(PBUF_RAW, g_cdc_ecm_rx_length, PBUF_POOL);
-            if (p != NULL) {
-                memcpy(p->payload, (uint8_t *)g_cdc_ecm_rx_buffer, g_cdc_ecm_rx_length);
-                g_cdc_ecm_rx_length = 0;
+            usbh_cdc_ecm_eth_input(g_cdc_ecm_rx_buffer, g_cdc_ecm_rx_length);
 
-                err = netif->input(p, netif);
-                if (err != ERR_OK) {
-                    pbuf_free(p);
-                }
-            } else {
-                g_cdc_ecm_rx_length = 0;
-                USB_LOG_ERR("No memory to alloc pbuf for cdc ecm rx\r\n");
-            }
+            g_cdc_ecm_rx_length = 0;
         } else {
+            /* There's no way to run here. */
         }
     }
     // clang-format off
@@ -283,38 +289,31 @@ delete:
     // clang-format on
 }
 
-err_t usbh_cdc_ecm_linkoutput(struct netif *netif, struct pbuf *p)
+uint8_t *usbh_cdc_ecm_get_eth_txbuf(void)
 {
-    int ret;
-    struct pbuf *q;
-    uint8_t *buffer = g_cdc_ecm_tx_buffer;
+    return g_cdc_ecm_tx_buffer;
+}
 
+int usbh_cdc_ecm_eth_output(uint32_t buflen)
+{
     if (g_cdc_ecm_class.connect_status == false) {
-        return ERR_BUF;
+        return -USB_ERR_NOTCONN;
     }
 
-    for (q = p; q != NULL; q = q->next) {
-        memcpy(buffer, q->payload, q->len);
-        buffer += q->len;
-    }
+    USB_LOG_DBG("txlen:%d\r\n", buflen);
 
-    USB_LOG_DBG("txlen:%d\r\n", p->tot_len);
-
-    usbh_bulk_urb_fill(&g_cdc_ecm_class.bulkout_urb, g_cdc_ecm_class.hport, g_cdc_ecm_class.bulkout, g_cdc_ecm_tx_buffer, p->tot_len, USB_OSAL_WAITING_FOREVER, NULL, NULL);
-    ret = usbh_submit_urb(&g_cdc_ecm_class.bulkout_urb);
-    if (ret < 0) {
-        return ERR_BUF;
-    }
-
-    return ERR_OK;
+    usbh_bulk_urb_fill(&g_cdc_ecm_class.bulkout_urb, g_cdc_ecm_class.hport, g_cdc_ecm_class.bulkout, g_cdc_ecm_tx_buffer, buflen, USB_OSAL_WAITING_FOREVER, NULL, NULL);
+    return usbh_submit_urb(&g_cdc_ecm_class.bulkout_urb);
 }
 
 __WEAK void usbh_cdc_ecm_run(struct usbh_cdc_ecm *cdc_ecm_class)
 {
+    (void)cdc_ecm_class;
 }
 
 __WEAK void usbh_cdc_ecm_stop(struct usbh_cdc_ecm *cdc_ecm_class)
 {
+    (void)cdc_ecm_class;
 }
 
 const struct usbh_class_driver cdc_ecm_class_driver = {
@@ -325,10 +324,9 @@ const struct usbh_class_driver cdc_ecm_class_driver = {
 
 CLASS_INFO_DEFINE const struct usbh_class_info cdc_ecm_class_info = {
     .match_flags = USB_CLASS_MATCH_INTF_CLASS | USB_CLASS_MATCH_INTF_SUBCLASS | USB_CLASS_MATCH_INTF_PROTOCOL,
-    .class = USB_DEVICE_CLASS_CDC,
-    .subclass = CDC_ETHERNET_NETWORKING_CONTROL_MODEL,
-    .protocol = CDC_COMMON_PROTOCOL_NONE,
-    .vid = 0x00,
-    .pid = 0x00,
+    .bInterfaceClass = USB_DEVICE_CLASS_CDC,
+    .bInterfaceSubClass = CDC_ETHERNET_NETWORKING_CONTROL_MODEL,
+    .bInterfaceProtocol = CDC_COMMON_PROTOCOL_NONE,
+    .id_table = NULL,
     .class_driver = &cdc_ecm_class_driver
 };

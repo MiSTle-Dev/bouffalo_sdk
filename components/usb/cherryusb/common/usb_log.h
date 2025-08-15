@@ -75,11 +75,57 @@
 
 #define USB_LOG_RAW(...) CONFIG_USB_PRINTF(__VA_ARGS__)
 
-void usb_assert(const char *filename, int linenum);
-#define USB_ASSERT(f)                       \
-    do {                                    \
-        if (!(f))                           \
-            usb_assert(__FILE__, __LINE__); \
-    } while (0)
+#ifndef CONFIG_USB_ASSERT_DISABLE
+#define USB_ASSERT(f)                                                            \
+    do {                                                                         \
+        if (!(f)) {                                                              \
+            USB_LOG_ERR("ASSERT FAIL [%s] @ %s:%d\r\n", #f, __FILE__, __LINE__); \
+            while (1) {                                                          \
+            }                                                                    \
+        }                                                                        \
+    } while (false)
+
+#define USB_ASSERT_MSG(f, fmt, ...)                                              \
+    do {                                                                         \
+        if (!(f)) {                                                              \
+            USB_LOG_ERR("ASSERT FAIL [%s] @ %s:%d\r\n", #f, __FILE__, __LINE__); \
+            USB_LOG_ERR(fmt "\r\n", ##__VA_ARGS__);                              \
+            while (1) {                                                          \
+            }                                                                    \
+        }                                                                        \
+    } while (false)
+#else
+#define USB_ASSERT(f) {}
+#define USB_ASSERT_MSG(f, fmt, ...) {}
+#endif
+
+#define ___is_print(ch) ((unsigned int)((ch) - ' ') < 127u - ' ')
+static inline void usb_hexdump(const void *ptr, uint32_t buflen)
+{
+    unsigned char *buf = (unsigned char *)ptr;
+    unsigned int i, j;
+
+    (void)buf;
+
+    for (i = 0; i < buflen; i += 16) {
+        CONFIG_USB_PRINTF("%08x:", i);
+
+        for (j = 0; j < 16; j++)
+            if (i + j < buflen) {
+                if ((j % 8) == 0) {
+                    CONFIG_USB_PRINTF("  ");
+                }
+
+                CONFIG_USB_PRINTF("%02X ", buf[i + j]);
+            } else
+                CONFIG_USB_PRINTF("   ");
+        CONFIG_USB_PRINTF(" ");
+
+        for (j = 0; j < 16; j++)
+            if (i + j < buflen)
+                CONFIG_USB_PRINTF("%c", ___is_print(buf[i + j]) ? buf[i + j] : '.');
+        CONFIG_USB_PRINTF("\n");
+    }
+}
 
 #endif /* USB_LOG_H */
