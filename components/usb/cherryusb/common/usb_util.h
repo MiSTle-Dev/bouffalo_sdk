@@ -45,8 +45,14 @@
 #define __ALIGNED(x) __attribute__((aligned(x)))
 #endif
 #elif defined(__ICCARM__) || defined(__ICCRX__) || defined(__ICCRISCV__)
+#if (__VER__ >= 8000000)
+  #define __ICCARM_V8 1
+#else
+  #define __ICCARM_V8 0
+#endif
+
 #ifndef __USED
-#if defined(__ICCARM_V8) || defined (__ICCRISCV__)
+#if defined(__ICCARM_V8) || defined(__ICCRISCV__)
 #define __USED __attribute__((used))
 #else
 #define __USED __root
@@ -54,7 +60,7 @@
 #endif
 
 #ifndef __WEAK
-#if defined(__ICCARM_V8) || defined (__ICCRISCV__)
+#if defined(__ICCARM_V8) || defined(__ICCRISCV__)
 #define __WEAK __attribute__((weak))
 #else
 #define __WEAK _Pragma("__weak")
@@ -62,7 +68,7 @@
 #endif
 
 #ifndef __PACKED
-#if defined(__ICCARM_V8) || defined (__ICCRISCV__)
+#if defined(__ICCARM_V8) || defined(__ICCRISCV__)
 #define __PACKED __attribute__((packed, aligned(1)))
 #else
 /* Needs IAR language extensions */
@@ -71,7 +77,7 @@
 #endif
 
 #ifndef __PACKED_STRUCT
-#if defined(__ICCARM_V8) || defined (__ICCRISCV__)
+#if defined(__ICCARM_V8) || defined(__ICCRISCV__)
 #define __PACKED_STRUCT struct __attribute__((packed, aligned(1)))
 #else
 /* Needs IAR language extensions */
@@ -80,7 +86,7 @@
 #endif
 
 #ifndef __PACKED_UNION
-#if defined(__ICCARM_V8) || defined (__ICCRISCV__)
+#if defined(__ICCARM_V8) || defined(__ICCRISCV__)
 #define __PACKED_UNION union __attribute__((packed, aligned(1)))
 #else
 /* Needs IAR language extensions */
@@ -89,7 +95,7 @@
 #endif
 
 #ifndef __ALIGNED
-#if defined(__ICCARM_V8) || defined (__ICCRISCV__)
+#if defined(__ICCARM_V8) || defined(__ICCRISCV__)
 #define __ALIGNED(x) __attribute__((aligned(x)))
 #elif (__VER__ >= 7080000)
 /* Needs IAR language extensions */
@@ -204,5 +210,16 @@
         9, 8, 7, 6, 5, 4, 3, 2, 1, 0
 
 #define USB_MEM_ALIGNX __attribute__((aligned(CONFIG_USB_ALIGN_SIZE)))
+
+#define USB_ALIGN_UP(size, align) (((size) + (align)-1) & ~((align)-1))
+#define USB_ALIGN_DOWN(size, align) ((size) & ~((align)-1))
+
+#ifndef usb_phyaddr2ramaddr
+#define usb_phyaddr2ramaddr(addr) (addr)
+#endif
+
+#ifndef usb_ramaddr2phyaddr
+#define usb_ramaddr2phyaddr(addr) (addr)
+#endif
 
 #endif /* USB_UTIL_H */

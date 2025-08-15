@@ -7,9 +7,18 @@
 #include "usbh_msc.h"
 #include "usb_scsi.h"
 
+#undef USB_DBG_TAG
+#define USB_DBG_TAG "usbh_msc"
+#include "usb_log.h"
+
 #define DEV_FORMAT "/dev/sd%c"
 
-USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_msc_buf[64];
+#ifndef CONFIG_USBHOST_MSC_READY_CHECK_TIMES
+#define CONFIG_USBHOST_MSC_READY_CHECK_TIMES 10
+#endif
+
+USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_msc_cbw_csw[CONFIG_USBHOST_MAX_MSC_CLASS][USB_ALIGN_UP(64, CONFIG_USB_ALIGN_SIZE)];
+USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_msc_buf[CONFIG_USBHOST_MAX_MSC_CLASS][USB_ALIGN_UP(64, CONFIG_USB_ALIGN_SIZE)];
 
 static struct usbh_msc g_msc_class[CONFIG_USBHOST_MAX_MSC_CLASS];
 static uint32_t g_devinuse = 0;
@@ -17,11 +26,11 @@ static struct usbh_msc_modeswitch_config *g_msc_modeswitch_config = NULL;
 
 static struct usbh_msc *usbh_msc_class_alloc(void)
 {
-    int devno;
+    uint8_t devno;
 
     for (devno = 0; devno < CONFIG_USBHOST_MAX_MSC_CLASS; devno++) {
-        if ((g_devinuse & (1 << devno)) == 0) {
-            g_devinuse |= (1 << devno);
+        if ((g_devinuse & (1U << devno)) == 0) {
+            g_devinuse |= (1U << devno);
             memset(&g_msc_class[devno], 0, sizeof(struct usbh_msc));
             g_msc_class[devno].sdchar = 'a' + devno;
             return &g_msc_class[devno];
@@ -32,17 +41,22 @@ static struct usbh_msc *usbh_msc_class_alloc(void)
 
 static void usbh_msc_class_free(struct usbh_msc *msc_class)
 {
-    int devno = msc_class->sdchar - 'a';
+    uint8_t devno = msc_class->sdchar - 'a';
 
-    if (devno >= 0 && devno < 32) {
-        g_devinuse &= ~(1 << devno);
+    if (devno < 32) {
+        g_devinuse &= ~(1U << devno);
     }
     memset(msc_class, 0, sizeof(struct usbh_msc));
 }
 
 static int usbh_msc_get_maxlun(struct usbh_msc *msc_class, uint8_t *buffer)
 {
-    struct usb_setup_packet *setup = msc_class->hport->setup;
+    struct usb_setup_packet *setup;
+
+    if (!msc_class || !msc_class->hport) {
+        return -USB_ERR_INVAL;
+    }
+    setup = msc_class->hport->setup;
 
     setup->bmRequestType = USB_REQUEST_DIR_IN | USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_INTERFACE;
     setup->bRequest = MSC_REQUEST_GET_MAX_LUN;
@@ -76,6 +90,8 @@ static void usbh_msc_cbw_dump(struct CBW *cbw)
 
 static void usbh_msc_csw_dump(struct CSW *csw)
 {
+    (void)csw;
+
     USB_LOG_DBG("CSW:\r\n");
     USB_LOG_DBG("  signature: 0x%08x\r\n", (unsigned int)csw->dSignature);
     USB_LOG_DBG("  tag:       0x%08x\r\n", (unsigned int)csw->dTag);
@@ -109,44 +125,44 @@ static inline int usbh_msc_bulk_out_transfer(struct usbh_msc *msc_class, uint8_t
     return ret;
 }
 
-static int usbh_bulk_cbw_csw_xfer(struct usbh_msc *msc_class, struct CBW *cbw, struct CSW *csw, uint8_t *buffer)
+static int usbh_bulk_cbw_csw_xfer(struct usbh_msc *msc_class, struct CBW *cbw, struct CSW *csw, uint8_t *buffer, uint32_t timeout)
 {
     int nbytes;
 
     usbh_msc_cbw_dump(cbw);
 
     /* Send the CBW */
-    nbytes = usbh_msc_bulk_out_transfer(msc_class, (uint8_t *)cbw, USB_SIZEOF_MSC_CBW, CONFIG_USBHOST_MSC_TIMEOUT);
+    nbytes = usbh_msc_bulk_out_transfer(msc_class, (uint8_t *)cbw, USB_SIZEOF_MSC_CBW, timeout);
     if (nbytes < 0) {
-        USB_LOG_ERR("cbw transfer error\r\n");
+        USB_LOG_ERR("cbw transfer error: %d\r\n", nbytes);
         goto __err_exit;
     }
 
     if (cbw->dDataLength != 0) {
         if (cbw->CB[0] == SCSI_CMD_WRITE10) {
-            nbytes = usbh_msc_bulk_out_transfer(msc_class, buffer, cbw->dDataLength, CONFIG_USBHOST_MSC_TIMEOUT);
+            nbytes = usbh_msc_bulk_out_transfer(msc_class, buffer, cbw->dDataLength, timeout);
         } else if (cbw->CB[0] == SCSI_CMD_READCAPACITY10) {
-            nbytes = usbh_msc_bulk_in_transfer(msc_class, buffer, cbw->dDataLength, CONFIG_USBHOST_MSC_TIMEOUT);
+            nbytes = usbh_msc_bulk_in_transfer(msc_class, buffer, cbw->dDataLength, timeout);
             if (nbytes >= 0) {
                 /* Save the capacity information */
                 msc_class->blocknum = GET_BE32(&buffer[0]) + 1;
                 msc_class->blocksize = GET_BE32(&buffer[4]);
             }
         } else {
-            nbytes = usbh_msc_bulk_in_transfer(msc_class, buffer, cbw->dDataLength, CONFIG_USBHOST_MSC_TIMEOUT);
+            nbytes = usbh_msc_bulk_in_transfer(msc_class, buffer, cbw->dDataLength, timeout);
         }
 
         if (nbytes < 0) {
-            USB_LOG_ERR("msc data transfer error\r\n");
+            USB_LOG_ERR("msc data transfer error: %d\r\n", nbytes);
             goto __err_exit;
         }
     }
 
     /* Receive the CSW */
     memset(csw, 0, USB_SIZEOF_MSC_CSW);
-    nbytes = usbh_msc_bulk_in_transfer(msc_class, (uint8_t *)csw, USB_SIZEOF_MSC_CSW, CONFIG_USBHOST_MSC_TIMEOUT);
+    nbytes = usbh_msc_bulk_in_transfer(msc_class, (uint8_t *)csw, USB_SIZEOF_MSC_CSW, timeout);
     if (nbytes < 0) {
-        USB_LOG_ERR("csw transfer error\r\n");
+        USB_LOG_ERR("csw transfer error: %d\r\n", nbytes);
         goto __err_exit;
     }
 
@@ -171,14 +187,14 @@ static inline int usbh_msc_scsi_testunitready(struct usbh_msc *msc_class)
     struct CBW *cbw;
 
     /* Construct the CBW */
-    cbw = (struct CBW *)g_msc_buf;
+    cbw = (struct CBW *)g_msc_cbw_csw[msc_class->sdchar - 'a'];
     memset(cbw, 0, USB_SIZEOF_MSC_CBW);
     cbw->dSignature = MSC_CBW_Signature;
 
     cbw->bCBLength = SCSICMD_TESTUNITREADY_SIZEOF;
     cbw->CB[0] = SCSI_CMD_TESTUNITREADY;
 
-    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_buf, NULL);
+    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_cbw_csw[msc_class->sdchar - 'a'], NULL, CONFIG_USBHOST_MSC_TIMEOUT);
 }
 
 static inline int usbh_msc_scsi_requestsense(struct usbh_msc *msc_class)
@@ -186,7 +202,7 @@ static inline int usbh_msc_scsi_requestsense(struct usbh_msc *msc_class)
     struct CBW *cbw;
 
     /* Construct the CBW */
-    cbw = (struct CBW *)g_msc_buf;
+    cbw = (struct CBW *)g_msc_cbw_csw[msc_class->sdchar - 'a'];
     memset(cbw, 0, USB_SIZEOF_MSC_CBW);
     cbw->dSignature = MSC_CBW_Signature;
 
@@ -196,7 +212,7 @@ static inline int usbh_msc_scsi_requestsense(struct usbh_msc *msc_class)
     cbw->CB[0] = SCSI_CMD_REQUESTSENSE;
     cbw->CB[4] = SCSIRESP_FIXEDSENSEDATA_SIZEOF;
 
-    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_buf, g_msc_buf);
+    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_cbw_csw[msc_class->sdchar - 'a'], g_msc_buf[msc_class->sdchar - 'a'], CONFIG_USBHOST_MSC_TIMEOUT);
 }
 
 static inline int usbh_msc_scsi_inquiry(struct usbh_msc *msc_class)
@@ -204,7 +220,7 @@ static inline int usbh_msc_scsi_inquiry(struct usbh_msc *msc_class)
     struct CBW *cbw;
 
     /* Construct the CBW */
-    cbw = (struct CBW *)g_msc_buf;
+    cbw = (struct CBW *)g_msc_cbw_csw[msc_class->sdchar - 'a'];
     memset(cbw, 0, USB_SIZEOF_MSC_CBW);
     cbw->dSignature = MSC_CBW_Signature;
 
@@ -214,7 +230,7 @@ static inline int usbh_msc_scsi_inquiry(struct usbh_msc *msc_class)
     cbw->CB[0] = SCSI_CMD_INQUIRY;
     cbw->CB[4] = SCSIRESP_INQUIRY_SIZEOF;
 
-    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_buf, g_msc_buf);
+    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_cbw_csw[msc_class->sdchar - 'a'], g_msc_buf[msc_class->sdchar - 'a'], CONFIG_USBHOST_MSC_TIMEOUT);
 }
 
 static inline int usbh_msc_scsi_readcapacity10(struct usbh_msc *msc_class)
@@ -222,7 +238,7 @@ static inline int usbh_msc_scsi_readcapacity10(struct usbh_msc *msc_class)
     struct CBW *cbw;
 
     /* Construct the CBW */
-    cbw = (struct CBW *)g_msc_buf;
+    cbw = (struct CBW *)g_msc_cbw_csw[msc_class->sdchar - 'a'];
     memset(cbw, 0, USB_SIZEOF_MSC_CBW);
     cbw->dSignature = MSC_CBW_Signature;
 
@@ -231,7 +247,7 @@ static inline int usbh_msc_scsi_readcapacity10(struct usbh_msc *msc_class)
     cbw->bCBLength = SCSICMD_READCAPACITY10_SIZEOF;
     cbw->CB[0] = SCSI_CMD_READCAPACITY10;
 
-    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_buf, g_msc_buf);
+    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_cbw_csw[msc_class->sdchar - 'a'], g_msc_buf[msc_class->sdchar - 'a'], CONFIG_USBHOST_MSC_TIMEOUT);
 }
 
 static inline void usbh_msc_modeswitch(struct usbh_msc *msc_class, const uint8_t *message)
@@ -239,18 +255,18 @@ static inline void usbh_msc_modeswitch(struct usbh_msc *msc_class, const uint8_t
     struct CBW *cbw;
 
     /* Construct the CBW */
-    cbw = (struct CBW *)g_msc_buf;
+    cbw = (struct CBW *)g_msc_cbw_csw[msc_class->sdchar - 'a'];
 
-    memcpy(g_msc_buf, message, 31);
+    memcpy(g_msc_cbw_csw[msc_class->sdchar - 'a'], message, 31);
 
-    usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_buf, NULL);
+    usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_cbw_csw[msc_class->sdchar - 'a'], NULL, CONFIG_USBHOST_MSC_TIMEOUT);
 }
 
 static int usbh_msc_connect(struct usbh_hubport *hport, uint8_t intf)
 {
     struct usb_endpoint_descriptor *ep_desc;
-    int ret;
     struct usbh_msc_modeswitch_config *config;
+    int ret;
 
     struct usbh_msc *msc_class = usbh_msc_class_alloc();
     if (msc_class == NULL) {
@@ -263,12 +279,18 @@ static int usbh_msc_connect(struct usbh_hubport *hport, uint8_t intf)
 
     hport->config.intf[intf].priv = msc_class;
 
-    ret = usbh_msc_get_maxlun(msc_class, g_msc_buf);
+    ret = usbh_msc_get_maxlun(msc_class, g_msc_buf[msc_class->sdchar - 'a']);
     if (ret < 0) {
-        return ret;
+        if (ret == -USB_ERR_STALL) {
+            USB_LOG_WRN("Device does not support multiple LUNs\r\n");
+            g_msc_buf[msc_class->sdchar - 'a'][0] = 0;
+            ret = 0;
+        } else {
+            return ret;
+        }
     }
 
-    USB_LOG_INFO("Get max LUN:%u\r\n", g_msc_buf[0] + 1);
+    USB_LOG_INFO("Get max LUN:%u\r\n", g_msc_buf[msc_class->sdchar - 'a'][0] + 1);
 
     for (uint8_t i = 0; i < hport->config.intf[intf].altsetting[0].intf_desc.bNumEndpoints; i++) {
         ep_desc = &hport->config.intf[intf].altsetting[0].ep[i].ep_desc;
@@ -297,34 +319,6 @@ static int usbh_msc_connect(struct usbh_hubport *hport, uint8_t intf)
         }
     }
 
-    ret = usbh_msc_scsi_testunitready(msc_class);
-    if (ret < 0) {
-        ret = usbh_msc_scsi_requestsense(msc_class);
-        if (ret < 0) {
-            USB_LOG_ERR("Fail to scsi_testunitready\r\n");
-            return ret;
-        }
-    }
-
-    ret = usbh_msc_scsi_inquiry(msc_class);
-    if (ret < 0) {
-        USB_LOG_ERR("Fail to scsi_inquiry\r\n");
-        return ret;
-    }
-    ret = usbh_msc_scsi_readcapacity10(msc_class);
-    if (ret < 0) {
-        USB_LOG_ERR("Fail to scsi_readcapacity10\r\n");
-        return ret;
-    }
-
-    if (msc_class->blocksize > 0) {
-        USB_LOG_INFO("Capacity info:\r\n");
-        USB_LOG_INFO("Block num:%d,block size:%d\r\n", (unsigned int)msc_class->blocknum, (unsigned int)msc_class->blocksize);
-    } else {
-        USB_LOG_ERR("Invalid block size\r\n");
-        return -USB_ERR_RANGE;
-    }
-
     snprintf(hport->config.intf[intf].devname, CONFIG_USBHOST_DEV_NAMELEN, DEV_FORMAT, msc_class->sdchar);
 
     USB_LOG_INFO("Register MSC Class:%s\r\n", hport->config.intf[intf].devname);
@@ -349,6 +343,7 @@ static int usbh_msc_disconnect(struct usbh_hubport *hport, uint8_t intf)
         }
 
         if (hport->config.intf[intf].devname[0] != '\0') {
+            usb_osal_thread_schedule_other();
             USB_LOG_INFO("Unregister MSC Class:%s\r\n", hport->config.intf[intf].devname);
             usbh_msc_stop(msc_class);
         }
@@ -359,13 +354,52 @@ static int usbh_msc_disconnect(struct usbh_hubport *hport, uint8_t intf)
     return ret;
 }
 
+int usbh_msc_scsi_init(struct usbh_msc *msc_class)
+{
+    int ret;
+    uint16_t cnt;
+
+    cnt = 0;
+    while (usbh_msc_scsi_testunitready(msc_class) < 0) {
+        USB_LOG_WRN("Device not ready, try again...\r\n");
+        ret = usbh_msc_scsi_requestsense(msc_class);
+        if (ret < 0) {
+            USB_LOG_ERR("Fail to scsi_testunitready\r\n");
+        }
+        cnt++;
+        if (cnt > CONFIG_USBHOST_MSC_READY_CHECK_TIMES) {
+            return -USB_ERR_NODEV;
+        }
+    }
+    ret = usbh_msc_scsi_inquiry(msc_class);
+    if (ret < 0) {
+        USB_LOG_ERR("Fail to scsi_inquiry\r\n");
+        return ret;
+    }
+
+    ret = usbh_msc_scsi_readcapacity10(msc_class);
+    if (ret < 0) {
+        USB_LOG_ERR("Fail to scsi_readcapacity10\r\n");
+        return ret;
+    }
+
+    if (msc_class->blocksize > 0) {
+        USB_LOG_INFO("Capacity info:\r\n");
+        USB_LOG_INFO("Block num:%d,block size:%d\r\n", (unsigned int)msc_class->blocknum, (unsigned int)msc_class->blocksize);
+    } else {
+        USB_LOG_ERR("Invalid block size\r\n");
+        return -USB_ERR_RANGE;
+    }
+
+    return 0;
+}
 
 int usbh_msc_scsi_write10(struct usbh_msc *msc_class, uint32_t start_sector, const uint8_t *buffer, uint32_t nsectors)
 {
     struct CBW *cbw;
 
     /* Construct the CBW */
-    cbw = (struct CBW *)g_msc_buf;
+    cbw = (struct CBW *)g_msc_cbw_csw[msc_class->sdchar - 'a'];
     memset(cbw, 0, USB_SIZEOF_MSC_CBW);
     cbw->dSignature = MSC_CBW_Signature;
 
@@ -376,7 +410,7 @@ int usbh_msc_scsi_write10(struct usbh_msc *msc_class, uint32_t start_sector, con
     SET_BE32(&cbw->CB[2], start_sector);
     SET_BE16(&cbw->CB[7], nsectors);
 
-    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_buf, (uint8_t *)buffer);
+    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_cbw_csw[msc_class->sdchar - 'a'], (uint8_t *)buffer, CONFIG_USBHOST_MSC_TIMEOUT);
 }
 
 int usbh_msc_scsi_read10(struct usbh_msc *msc_class, uint32_t start_sector, const uint8_t *buffer, uint32_t nsectors)
@@ -384,7 +418,7 @@ int usbh_msc_scsi_read10(struct usbh_msc *msc_class, uint32_t start_sector, cons
     struct CBW *cbw;
 
     /* Construct the CBW */
-    cbw = (struct CBW *)g_msc_buf;
+    cbw = (struct CBW *)g_msc_cbw_csw[msc_class->sdchar - 'a'];
     memset(cbw, 0, USB_SIZEOF_MSC_CBW);
     cbw->dSignature = MSC_CBW_Signature;
 
@@ -396,7 +430,7 @@ int usbh_msc_scsi_read10(struct usbh_msc *msc_class, uint32_t start_sector, cons
     SET_BE32(&cbw->CB[2], start_sector);
     SET_BE16(&cbw->CB[7], nsectors);
 
-    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_buf, (uint8_t *)buffer);
+    return usbh_bulk_cbw_csw_xfer(msc_class, cbw, (struct CSW *)g_msc_cbw_csw[msc_class->sdchar - 'a'], (uint8_t *)buffer, CONFIG_USBHOST_MSC_TIMEOUT);
 }
 
 void usbh_msc_modeswitch_enable(struct usbh_msc_modeswitch_config *config)
@@ -410,10 +444,12 @@ void usbh_msc_modeswitch_enable(struct usbh_msc_modeswitch_config *config)
 
 __WEAK void usbh_msc_run(struct usbh_msc *msc_class)
 {
+    (void)msc_class;
 }
 
 __WEAK void usbh_msc_stop(struct usbh_msc *msc_class)
 {
+    (void)msc_class;
 }
 
 const struct usbh_class_driver msc_class_driver = {
@@ -424,10 +460,9 @@ const struct usbh_class_driver msc_class_driver = {
 
 CLASS_INFO_DEFINE const struct usbh_class_info msc_class_info = {
     .match_flags = USB_CLASS_MATCH_INTF_CLASS | USB_CLASS_MATCH_INTF_SUBCLASS | USB_CLASS_MATCH_INTF_PROTOCOL,
-    .class = USB_DEVICE_CLASS_MASS_STORAGE,
-    .subclass = MSC_SUBCLASS_SCSI,
-    .protocol = MSC_PROTOCOL_BULK_ONLY,
-    .vid = 0x00,
-    .pid = 0x00,
+    .bInterfaceClass = USB_DEVICE_CLASS_MASS_STORAGE,
+    .bInterfaceSubClass = MSC_SUBCLASS_SCSI,
+    .bInterfaceProtocol = MSC_PROTOCOL_BULK_ONLY,
+    .id_table = NULL,
     .class_driver = &msc_class_driver
 };

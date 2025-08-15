@@ -20,6 +20,8 @@ struct usbh_msc {
     uint8_t sdchar;
     uint32_t blocknum;  /* Number of blocks on the USB mass storage device */
     uint16_t blocksize; /* Block size of USB mass storage device */
+
+    void *user_data;
 };
 
 struct usbh_msc_modeswitch_config {
@@ -30,6 +32,7 @@ struct usbh_msc_modeswitch_config {
 };
 
 void usbh_msc_modeswitch_enable(struct usbh_msc_modeswitch_config *config);
+int usbh_msc_scsi_init(struct usbh_msc *msc_class);
 int usbh_msc_scsi_write10(struct usbh_msc *msc_class, uint32_t start_sector, const uint8_t *buffer, uint32_t nsectors);
 int usbh_msc_scsi_read10(struct usbh_msc *msc_class, uint32_t start_sector, const uint8_t *buffer, uint32_t nsectors);
 
