@@ -3,10 +3,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-#include "usb_hc_ehci.h"
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-#include "usb_hc_ohci.h"
-#endif
+#include "usb_ehci_priv.h"
 
 #define EHCI_TUNE_CERR    3 /* 0-3 qtd retries; 0 == don't stop */
 #define EHCI_TUNE_RL_HS   4 /* nak throttle; see 4.9 */
@@ -14,135 +11,102 @@
 #define EHCI_TUNE_MULT_HS 1 /* 1-3 transactions/uframe; 4.10.3 */
 #define EHCI_TUNE_MULT_TT 1
 
-struct ehci_hcd g_ehci_hcd[CONFIG_USBHOST_MAX_BUS];
+struct ehci_hcd g_ehci_hcd;
 
-USB_NOCACHE_RAM_SECTION struct ehci_qh_hw ehci_qh_pool[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_QH_NUM];
-USB_NOCACHE_RAM_SECTION struct ehci_qtd_hw ehci_qtd_pool[CONFIG_USBHOST_MAX_BUS][CONFIG_USB_EHCI_QTD_NUM];
+USB_NOCACHE_RAM_SECTION struct ehci_qh_hw ehci_qh_pool[CONFIG_USB_EHCI_QH_NUM];
+USB_NOCACHE_RAM_SECTION struct ehci_qtd_hw ehci_qtd_pool[CONFIG_USB_EHCI_QTD_NUM];
 
 /* The head of the asynchronous queue */
-USB_NOCACHE_RAM_SECTION struct ehci_qh_hw g_async_qh_head[CONFIG_USBHOST_MAX_BUS];
+USB_NOCACHE_RAM_SECTION struct ehci_qh_hw g_async_qh_head;
 /* The head of the periodic queue */
-USB_NOCACHE_RAM_SECTION struct ehci_qh_hw g_periodic_qh_head[CONFIG_USBHOST_MAX_BUS];
+USB_NOCACHE_RAM_SECTION struct ehci_qh_hw g_periodic_qh_head[EHCI_PERIOIDIC_QH_NUM];
 
 /* The frame list */
-USB_NOCACHE_RAM_SECTION uint32_t g_framelist[CONFIG_USBHOST_MAX_BUS][USB_ALIGN_UP(CONFIG_USB_EHCI_FRAME_LIST_SIZE, 1024)] __attribute__((aligned(4096)));
+USB_NOCACHE_RAM_SECTION uint32_t g_framelist[CONFIG_USB_EHCI_FRAME_LIST_SIZE] __attribute__((aligned(4096)));
 
-static struct ehci_qtd_hw *ehci_qtd_alloc(struct usbh_bus *bus)
-{
-    struct ehci_qtd_hw *qtd;
-    size_t flags;
-
-    flags = usb_osal_enter_critical_section();
-    for (uint32_t i = 0; i < CONFIG_USB_EHCI_QTD_NUM; i++) {
-        qtd = &ehci_qtd_pool[bus->hcd.hcd_id][i];
-        if (!qtd->inuse) {
-            qtd->inuse = true;
-            usb_osal_leave_critical_section(flags);
-
-            memset(&qtd->hw, 0, sizeof(struct ehci_qtd));
-            qtd->hw.next_qtd = QTD_LIST_END;
-            qtd->hw.alt_next_qtd = QTD_LIST_END;
-            qtd->hw.token = QTD_TOKEN_STATUS_HALTED;
-            qtd->urb = NULL;
-            qtd->bufaddr = 0;
-            qtd->length = 0;
-
-            return qtd;
-        }
-    }
-    usb_osal_leave_critical_section(flags);
-    return NULL;
-}
-
-static void ehci_qtd_free(struct usbh_bus *bus, struct ehci_qtd_hw *qtd)
-{
-    size_t flags;
-
-    (void)bus;
-
-    flags = usb_osal_enter_critical_section();
-    qtd->inuse = false;
-    qtd->urb = NULL;
-    usb_osal_leave_critical_section(flags);
-}
-
-static struct ehci_qh_hw *ehci_qh_alloc(struct usbh_bus *bus)
+static struct ehci_qh_hw *ehci_qh_alloc(void)
 {
     struct ehci_qh_hw *qh;
+    usb_osal_sem_t waitsem;
     size_t flags;
 
-    flags = usb_osal_enter_critical_section();
     for (uint32_t i = 0; i < CONFIG_USB_EHCI_QH_NUM; i++) {
-        qh = &ehci_qh_pool[bus->hcd.hcd_id][i];
-        if (!qh->inuse) {
-            qh->inuse = true;
+        if (!g_ehci_hcd.ehci_qh_used[i]) {
+            flags = usb_osal_enter_critical_section();
+            g_ehci_hcd.ehci_qh_used[i] = true;
             usb_osal_leave_critical_section(flags);
 
-            memset(&qh->hw, 0, sizeof(struct ehci_qh));
+            qh = &ehci_qh_pool[i];
+            waitsem = qh->waitsem;
+            memset(qh, 0, sizeof(struct ehci_qh_hw));
             qh->hw.hlp = QTD_LIST_END;
             qh->hw.overlay.next_qtd = QTD_LIST_END;
             qh->hw.overlay.alt_next_qtd = QTD_LIST_END;
-            qh->urb = NULL;
-            qh->first_qtd = QTD_LIST_END;
-            qh->remove_in_iaad = 0;
-
+            qh->waitsem = waitsem;
             return qh;
         }
     }
-    usb_osal_leave_critical_section(flags);
     return NULL;
 }
 
-static void ehci_qh_free(struct usbh_bus *bus, struct ehci_qh_hw *qh)
+static void ehci_qh_free(struct ehci_qh_hw *qh)
+{
+    size_t flags;
+
+    for (uint32_t i = 0; i < CONFIG_USB_EHCI_QH_NUM; i++) {
+        if (&ehci_qh_pool[i] == qh) {
+            flags = usb_osal_enter_critical_section();
+            g_ehci_hcd.ehci_qh_used[i] = false;
+            usb_osal_leave_critical_section(flags);
+
+            qh->urb = NULL;
+            return;
+        }
+    }
+}
+
+static struct ehci_qtd_hw *ehci_qtd_alloc(void)
 {
     struct ehci_qtd_hw *qtd;
     size_t flags;
 
-    flags = usb_osal_enter_critical_section();
-    if (qh->urb) {
-        qh->urb->hcpriv = NULL;
-        qh->urb = NULL;
-    }
-    qtd = EHCI_ADDR2QTD(qh->first_qtd);
+    for (uint32_t i = 0; i < CONFIG_USB_EHCI_QTD_NUM; i++) {
+        if (!g_ehci_hcd.ehci_qtd_used[i]) {
+            flags = usb_osal_enter_critical_section();
+            g_ehci_hcd.ehci_qtd_used[i] = true;
+            usb_osal_leave_critical_section(flags);
 
-    while (qtd) {
-        ehci_qtd_free(bus, qtd);
-        qtd = EHCI_ADDR2QTD(qtd->hw.next_qtd);
+            qtd = &ehci_qtd_pool[i];
+            memset(qtd, 0, sizeof(struct ehci_qtd_hw));
+            qtd->hw.next_qtd = QTD_LIST_END;
+            qtd->hw.alt_next_qtd = QTD_LIST_END;
+            qtd->hw.token = QTD_TOKEN_STATUS_HALTED;
+            return qtd;
+        }
     }
-
-    qh->inuse = false;
-    qh->first_qtd = QTD_LIST_END;
-    usb_osal_leave_critical_section(flags);
+    return NULL;
 }
 
-#if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
-static inline void usb_ehci_qh_qtd_flush(struct ehci_qh_hw *qh)
+static void ehci_qtd_free(struct ehci_qtd_hw *qtd)
 {
-    struct ehci_qtd_hw *qtd;
+    size_t flags;
 
-    qtd = EHCI_ADDR2QTD(qh->first_qtd);
+    for (uint32_t i = 0; i < CONFIG_USB_EHCI_QTD_NUM; i++) {
+        if (&ehci_qtd_pool[i] == qtd) {
+            flags = usb_osal_enter_critical_section();
+            g_ehci_hcd.ehci_qtd_used[i] = false;
+            usb_osal_leave_critical_section(flags);
 
-    while (qtd) {
-        usb_dcache_clean((uintptr_t)&qtd->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
-        qtd = EHCI_ADDR2QTD(qtd->hw.next_qtd);
+            qtd->urb = NULL;
+            return;
+        }
     }
-    usb_dcache_clean((uintptr_t)&qh->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
 }
-#else
-#define usb_ehci_qh_qtd_flush(qh)
-#endif
 
 static inline void ehci_qh_add_head(struct ehci_qh_hw *head, struct ehci_qh_hw *n)
 {
     n->hw.hlp = head->hw.hlp;
-    usb_ehci_qh_qtd_flush(n);
-
-    usb_dcache_flush((uintptr_t)n->urb->transfer_buffer, USB_ALIGN_UP(n->urb->transfer_buffer_length, CONFIG_USB_ALIGN_SIZE));
-
     head->hw.hlp = QH_HLP_QH(n);
-#if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
-    usb_dcache_clean((uintptr_t)&head->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
-#endif
 }
 
 static inline void ehci_qh_remove(struct ehci_qh_hw *head, struct ehci_qh_hw *n)
@@ -155,9 +119,6 @@ static inline void ehci_qh_remove(struct ehci_qh_hw *head, struct ehci_qh_hw *n)
 
     if (tmp) {
         tmp->hw.hlp = n->hw.hlp;
-#if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
-        usb_dcache_clean((uintptr_t)&tmp->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
-#endif
     }
 }
 
@@ -181,6 +142,19 @@ static int ehci_caculate_smask(int binterval)
         interval >>= 1;
     }
     return (0x1 << (order % 8));
+}
+
+static struct ehci_qh_hw *ehci_get_periodic_qhead(uint8_t interval)
+{
+    interval /= 8;
+
+    for (uint8_t i = 0; i < EHCI_PERIOIDIC_QH_NUM - 1; i++) {
+        interval >>= 1;
+        if (interval == 0) {
+            return &g_periodic_qh_head[i];
+        }
+    }
+    return &g_periodic_qh_head[EHCI_PERIOIDIC_QH_NUM - 1];
 }
 
 static void ehci_qh_fill(struct ehci_qh_hw *qh,
@@ -233,7 +207,6 @@ static void ehci_qh_fill(struct ehci_qh_hw *qh,
     switch (speed) {
         case USB_SPEED_LOW:
             epchar |= QH_EPCHAR_EPS_LOW;
-            __attribute__((fallthrough));
         case USB_SPEED_FULL:
             if (ep_type == USB_ENDPOINT_TYPE_CONTROL) {
                 epchar |= QH_EPCHAR_C; /* for TT */
@@ -320,12 +293,11 @@ static void ehci_qtd_fill(struct ehci_qtd_hw *qtd, uint32_t bufaddr, size_t bufl
 
     qtd->hw.token = token;
 
-    ehci_qtd_bpl_fill(qtd, usb_phyaddr2ramaddr(bufaddr), buflen);
-    qtd->bufaddr = bufaddr;
-    qtd->length = buflen;
+    ehci_qtd_bpl_fill(qtd, bufaddr, buflen);
+    qtd->total_len = buflen;
 }
 
-static struct ehci_qh_hw *ehci_control_urb_init(struct usbh_bus *bus, struct usbh_urb *urb, struct usb_setup_packet *setup, uint8_t *buffer, uint32_t buflen)
+static struct ehci_qh_hw *ehci_control_urb_init(struct usbh_urb *urb, struct usb_setup_packet *setup, uint8_t *buffer, uint32_t buflen)
 {
     struct ehci_qh_hw *qh = NULL;
     struct ehci_qtd_hw *qtd_setup = NULL;
@@ -334,14 +306,27 @@ static struct ehci_qh_hw *ehci_control_urb_init(struct usbh_bus *bus, struct usb
     uint32_t token;
     size_t flags;
 
-    qh = ehci_qh_alloc(bus);
+    qh = ehci_qh_alloc();
     if (qh == NULL) {
         return NULL;
     }
 
-    qtd_setup = ehci_qtd_alloc(bus);
-    qtd_status = ehci_qtd_alloc(bus);
-    USB_ASSERT_MSG(qtd_setup && qtd_status, "ctrl qtd alloc failed");
+    qtd_setup = ehci_qtd_alloc();
+    if (buflen > 0) {
+        qtd_data = ehci_qtd_alloc();
+    }
+
+    qtd_status = ehci_qtd_alloc();
+    if (qtd_status == NULL) {
+        ehci_qh_free(qh);
+        if (qtd_setup) {
+            ehci_qtd_free(qtd_setup);
+        }
+        if (qtd_data) {
+            ehci_qtd_free(qtd_data);
+        }
+        return NULL;
+    }
 
     ehci_qh_fill(qh,
                  urb->hport->dev_addr,
@@ -365,9 +350,6 @@ static struct ehci_qh_hw *ehci_control_urb_init(struct usbh_bus *bus, struct usb
 
     /* fill data qtd */
     if (setup->wLength > 0) {
-        qtd_data = ehci_qtd_alloc(bus);
-        USB_ASSERT_MSG(qtd_data, "ctrl qtd alloc failed");
-
         if ((setup->bmRequestType & 0x80) == 0x80) {
             token = QTD_TOKEN_PID_IN;
         } else {
@@ -415,7 +397,7 @@ static struct ehci_qh_hw *ehci_control_urb_init(struct usbh_bus *bus, struct usb
     qh->urb = urb;
     urb->hcpriv = qh;
     /* add qh into async list */
-    ehci_qh_add_head(&g_async_qh_head[bus->hcd.hcd_id], qh);
+    ehci_qh_add_head(&g_async_qh_head, qh);
 
     EHCI_HCOR->usbcmd |= EHCI_USBCMD_ASEN;
 
@@ -423,18 +405,30 @@ static struct ehci_qh_hw *ehci_control_urb_init(struct usbh_bus *bus, struct usb
     return qh;
 }
 
-static struct ehci_qh_hw *ehci_bulk_urb_init(struct usbh_bus *bus, struct usbh_urb *urb, uint8_t *buffer, uint32_t buflen)
+static struct ehci_qh_hw *ehci_bulk_urb_init(struct usbh_urb *urb, uint8_t *buffer, uint32_t buflen)
 {
     struct ehci_qh_hw *qh = NULL;
     struct ehci_qtd_hw *qtd = NULL;
     struct ehci_qtd_hw *first_qtd = NULL;
     struct ehci_qtd_hw *prev_qtd = NULL;
+    uint32_t qtd_num = 0;
     uint32_t xfer_len = 0;
     uint32_t token;
     size_t flags;
 
-    qh = ehci_qh_alloc(bus);
+    qh = ehci_qh_alloc();
     if (qh == NULL) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < CONFIG_USB_EHCI_QTD_NUM; i++) {
+        if (!g_ehci_hcd.ehci_qtd_used[i]) {
+            qtd_num++;
+        }
+    }
+
+    if (qtd_num < ((buflen + 0x3fff) / 0x4000)) {
+        ehci_qh_free(qh);
         return NULL;
     }
 
@@ -449,9 +443,8 @@ static struct ehci_qh_hw *ehci_bulk_urb_init(struct usbh_bus *bus, struct usbh_u
                  urb->hport->parent->hub_addr,
                  urb->hport->port);
 
-    while (1) {
-        qtd = ehci_qtd_alloc(bus);
-        USB_ASSERT_MSG(qtd, "bulk qtd alloc failed");
+    while (buflen >= 0) {
+        qtd = ehci_qtd_alloc();
 
         if (buflen > 0x4000) {
             xfer_len = 0x4000;
@@ -511,7 +504,7 @@ static struct ehci_qh_hw *ehci_bulk_urb_init(struct usbh_bus *bus, struct usbh_u
     qh->urb = urb;
     urb->hcpriv = qh;
     /* add qh into async list */
-    ehci_qh_add_head(&g_async_qh_head[bus->hcd.hcd_id], qh);
+    ehci_qh_add_head(&g_async_qh_head, qh);
 
     EHCI_HCOR->usbcmd |= EHCI_USBCMD_ASEN;
 
@@ -519,18 +512,30 @@ static struct ehci_qh_hw *ehci_bulk_urb_init(struct usbh_bus *bus, struct usbh_u
     return qh;
 }
 
-static struct ehci_qh_hw *ehci_intr_urb_init(struct usbh_bus *bus, struct usbh_urb *urb, uint8_t *buffer, uint32_t buflen)
+static struct ehci_qh_hw *ehci_intr_urb_init(struct usbh_urb *urb, uint8_t *buffer, uint32_t buflen)
 {
     struct ehci_qh_hw *qh = NULL;
     struct ehci_qtd_hw *qtd = NULL;
     struct ehci_qtd_hw *first_qtd = NULL;
     struct ehci_qtd_hw *prev_qtd = NULL;
+    uint32_t qtd_num = 0;
     uint32_t xfer_len = 0;
     uint32_t token;
     size_t flags;
 
-    qh = ehci_qh_alloc(bus);
+    qh = ehci_qh_alloc();
     if (qh == NULL) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < CONFIG_USB_EHCI_QTD_NUM; i++) {
+        if (!g_ehci_hcd.ehci_qtd_used[i]) {
+            qtd_num++;
+        }
+    }
+
+    if (qtd_num < ((buflen + 0x3fff) / 0x4000)) {
+        ehci_qh_free(qh);
         return NULL;
     }
 
@@ -545,9 +550,8 @@ static struct ehci_qh_hw *ehci_intr_urb_init(struct usbh_bus *bus, struct usbh_u
                  urb->hport->parent->hub_addr,
                  urb->hport->port);
 
-    while (1) {
-        qtd = ehci_qtd_alloc(bus);
-        USB_ASSERT_MSG(qtd, "intr qtd alloc failed");
+    while (buflen >= 0) {
+        qtd = ehci_qtd_alloc();
 
         if (buflen > 0x4000) {
             xfer_len = 0x4000;
@@ -607,7 +611,11 @@ static struct ehci_qh_hw *ehci_intr_urb_init(struct usbh_bus *bus, struct usbh_u
     qh->urb = urb;
     urb->hcpriv = qh;
     /* add qh into periodic list */
-    ehci_qh_add_head(&g_periodic_qh_head[bus->hcd.hcd_id], qh);
+    if (urb->hport->speed == USB_SPEED_HIGH) {
+        ehci_qh_add_head(ehci_get_periodic_qhead(urb->ep->bInterval), qh);
+    } else {
+        ehci_qh_add_head(ehci_get_periodic_qhead(urb->ep->bInterval * 8), qh);
+    }
 
     EHCI_HCOR->usbcmd |= EHCI_USBCMD_PSEN;
 
@@ -615,18 +623,21 @@ static struct ehci_qh_hw *ehci_intr_urb_init(struct usbh_bus *bus, struct usbh_u
     return qh;
 }
 
-static void ehci_urb_waitup(struct usbh_bus *bus, struct usbh_urb *urb)
+static void ehci_urb_waitup(struct usbh_urb *urb)
 {
     struct ehci_qh_hw *qh;
 
     qh = (struct ehci_qh_hw *)urb->hcpriv;
+    qh->urb = NULL;
+    urb->hcpriv = NULL;
 
     qh->remove_in_iaad = 0;
 
     if (urb->timeout) {
+        urb->timeout = 0;
         usb_osal_sem_give(qh->waitsem);
     } else {
-        ehci_qh_free(bus, qh);
+        ehci_qh_free(qh);
     }
 
     if (urb->complete) {
@@ -638,24 +649,24 @@ static void ehci_urb_waitup(struct usbh_bus *bus, struct usbh_urb *urb)
     }
 }
 
-static void ehci_qh_scan_qtds(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct ehci_qh_hw *qh)
+static void ehci_qh_scan_qtds(struct ehci_qh_hw *qhead, struct ehci_qh_hw *qh)
 {
     struct ehci_qtd_hw *qtd;
-
-    (void)bus;
 
     ehci_qh_remove(qhead, qh);
 
     qtd = EHCI_ADDR2QTD(qh->first_qtd);
 
     while (qtd) {
-        qtd->urb->actual_length += (qtd->length - ((qtd->hw.token & QTD_TOKEN_NBYTES_MASK) >> QTD_TOKEN_NBYTES_SHIFT));
+        qtd->urb->actual_length += (qtd->total_len - ((qtd->hw.token & QTD_TOKEN_NBYTES_MASK) >> QTD_TOKEN_NBYTES_SHIFT));
 
-        qtd = EHCI_ADDR2QTD(qtd->hw.next_qtd);
+        ehci_qtd_free(qtd);
+        qh->first_qtd = qtd->hw.next_qtd;
+        qtd = EHCI_ADDR2QTD(qh->first_qtd);
     }
 }
 
-static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct ehci_qh_hw *qh)
+static void ehci_check_qh(struct ehci_qh_hw *qhead, struct ehci_qh_hw *qh)
 {
     struct usbh_urb *urb;
     struct ehci_qtd_hw *qtd;
@@ -668,9 +679,6 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
     }
 
     while (qtd) {
-#if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
-        usb_dcache_invalidate((uintptr_t)&qtd->hw, CONFIG_USB_EHCI_ALIGN_SIZE);
-#endif
         token = qtd->hw.token;
 
         if (token & QTD_TOKEN_STATUS_ERRORS) {
@@ -685,7 +693,7 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
     urb = qh->urb;
 
     if ((token & QTD_TOKEN_STATUS_ERRORS) == 0) {
-        if (token & QTD_TOKEN_TOGGLE) {
+        if (qh->hw.overlay.token & QTD_TOKEN_TOGGLE) {
             urb->data_toggle = true;
         } else {
             urb->data_toggle = false;
@@ -703,10 +711,10 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
         }
     }
 
-    ehci_qh_scan_qtds(bus, qhead, qh);
+    ehci_qh_scan_qtds(qhead, qh);
 
     if (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT) {
-        ehci_urb_waitup(bus, urb);
+        ehci_urb_waitup(urb);
     } else {
         qh->remove_in_iaad = 1;
 
@@ -714,20 +722,28 @@ static void ehci_check_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct
     }
 }
 
-static void ehci_kill_qh(struct usbh_bus *bus, struct ehci_qh_hw *qhead, struct ehci_qh_hw *qh)
+static void ehci_kill_qh(struct ehci_qh_hw *qhead, struct ehci_qh_hw *qh)
 {
-    (void)bus;
+    struct ehci_qtd_hw *qtd;
 
     ehci_qh_remove(qhead, qh);
+
+    qtd = EHCI_ADDR2QTD(qh->first_qtd);
+
+    while (qtd) {
+        ehci_qtd_free(qtd);
+        qh->first_qtd = qtd->hw.next_qtd;
+        qtd = EHCI_ADDR2QTD(qh->first_qtd);
+    }
 }
 
-static int usbh_reset_port(struct usbh_bus *bus, const uint8_t port)
+static int usbh_reset_port(const uint8_t port)
 {
     volatile uint32_t timeout = 0;
     uint32_t regval;
 
 #if defined(CONFIG_USB_EHCI_HPMICRO) && CONFIG_USB_EHCI_HPMICRO
-    if ((*(volatile uint32_t *)(bus->hcd.reg_base + 0x224) & 0xc0) == (2 << 6)) { /* Hardcode for hpm */
+    if ((*(volatile uint32_t *)(CONFIG_HPM_USBH_BASE + 0x224) & 0xc0) == (2 << 6)) { /* Hardcode for hpm */
         EHCI_HCOR->portsc[port - 1] |= (1 << 29);
     } else {
         EHCI_HCOR->portsc[port - 1] &= ~(1 << 29);
@@ -751,103 +767,80 @@ static int usbh_reset_port(struct usbh_bus *bus, const uint8_t port)
     return 0;
 }
 
-__WEAK void usb_hc_low_level_init(struct usbh_bus *bus)
+__WEAK void usb_hc_low_level_init(void)
 {
-    (void)bus;
 }
 
-__WEAK void usb_hc_low_level2_init(struct usbh_bus *bus)
+__WEAK void usb_hc_low_level2_init(void)
 {
-    (void)bus;
 }
 
-__WEAK void usb_hc_low_level_deinit(struct usbh_bus *bus)
+int usb_hc_init(void)
 {
-    (void)bus;
-}
-
-int usb_hc_init(struct usbh_bus *bus)
-{
+    uint32_t interval;
     struct ehci_qh_hw *qh;
-    struct ehci_qtd_hw *qtd;
 
     volatile uint32_t timeout = 0;
     uint32_t regval;
 
-    memset(&g_ehci_hcd[bus->hcd.hcd_id], 0, sizeof(struct ehci_hcd));
-    memset(ehci_qh_pool[bus->hcd.hcd_id], 0, sizeof(struct ehci_qh_hw) * CONFIG_USB_EHCI_QH_NUM);
-    memset(ehci_qtd_pool[bus->hcd.hcd_id], 0, sizeof(struct ehci_qtd_hw) * CONFIG_USB_EHCI_QTD_NUM);
+    memset(&g_ehci_hcd, 0, sizeof(struct ehci_hcd));
 
-    for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
-        qh = &ehci_qh_pool[bus->hcd.hcd_id][index];
-        if ((uint32_t)&qh->hw % 32) {
-            USB_LOG_ERR("struct ehci_qh_hw is not align 32\r\n");
-            return -USB_ERR_INVAL;
-        }
+    if (sizeof(struct ehci_qh_hw) % 32) {
+        USB_LOG_ERR("struct ehci_qh_hw is not align 32\r\n");
+        return -USB_ERR_INVAL;
     }
-
-    for (uint8_t index = 0; index < CONFIG_USB_EHCI_QTD_NUM; index++) {
-        qtd = &ehci_qtd_pool[bus->hcd.hcd_id][index];
-        if ((uint32_t)&qtd->hw % 32) {
-            USB_LOG_ERR("struct ehci_qtd_hw is not align 32\r\n");
-            return -USB_ERR_INVAL;
-        }
+    if (sizeof(struct ehci_qtd_hw) % 32) {
+        USB_LOG_ERR("struct ehci_qtd_hw is not align 32\r\n");
+        return -USB_ERR_INVAL;
     }
 
     for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
-        qh = &ehci_qh_pool[bus->hcd.hcd_id][index];
+        qh = &ehci_qh_pool[index];
         qh->waitsem = usb_osal_sem_create(0);
     }
 
-    memset(&g_async_qh_head[bus->hcd.hcd_id], 0, sizeof(struct ehci_qh_hw));
-    g_async_qh_head[bus->hcd.hcd_id].hw.hlp = QH_HLP_QH(&g_async_qh_head[bus->hcd.hcd_id]);
-    g_async_qh_head[bus->hcd.hcd_id].hw.epchar = QH_EPCHAR_H;
-    g_async_qh_head[bus->hcd.hcd_id].hw.overlay.next_qtd = QTD_LIST_END;
-    g_async_qh_head[bus->hcd.hcd_id].hw.overlay.alt_next_qtd = QTD_LIST_END;
-    g_async_qh_head[bus->hcd.hcd_id].hw.overlay.token = QTD_TOKEN_STATUS_HALTED;
-    g_async_qh_head[bus->hcd.hcd_id].first_qtd = QTD_LIST_END;
+    memset(&g_async_qh_head, 0, sizeof(struct ehci_qh_hw));
+    g_async_qh_head.hw.hlp = QH_HLP_QH(&g_async_qh_head);
+    g_async_qh_head.hw.epchar = QH_EPCHAR_H;
+    g_async_qh_head.hw.overlay.next_qtd = QTD_LIST_END;
+    g_async_qh_head.hw.overlay.alt_next_qtd = QTD_LIST_END;
+    g_async_qh_head.hw.overlay.token = QTD_TOKEN_STATUS_HALTED;
+    g_async_qh_head.first_qtd = QTD_LIST_END;
 
-    memset(g_framelist[bus->hcd.hcd_id], 0, sizeof(uint32_t) * CONFIG_USB_EHCI_FRAME_LIST_SIZE);
+    memset(g_framelist, 0, sizeof(uint32_t) * CONFIG_USB_EHCI_FRAME_LIST_SIZE);
 
-    memset(&g_periodic_qh_head[bus->hcd.hcd_id], 0, sizeof(struct ehci_qh_hw));
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.hlp = QH_HLP_END;
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.epchar = QH_EPCAPS_SSMASK(1);
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.overlay.next_qtd = QTD_LIST_END;
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.overlay.alt_next_qtd = QTD_LIST_END;
-    g_periodic_qh_head[bus->hcd.hcd_id].hw.overlay.token = QTD_TOKEN_STATUS_HALTED;
-    g_periodic_qh_head[bus->hcd.hcd_id].first_qtd = QTD_LIST_END;
+    for (int i = EHCI_PERIOIDIC_QH_NUM - 1; i >= 0; i--) {
+        memset(&g_periodic_qh_head[i], 0, sizeof(struct ehci_qh_hw));
+        g_periodic_qh_head[i].hw.hlp = QH_HLP_END;
+        g_periodic_qh_head[i].hw.epchar = QH_EPCAPS_SSMASK(1);
+        g_periodic_qh_head[i].hw.overlay.next_qtd = QTD_LIST_END;
+        g_periodic_qh_head[i].hw.overlay.alt_next_qtd = QTD_LIST_END;
+        g_periodic_qh_head[i].hw.overlay.token = QTD_TOKEN_STATUS_HALTED;
+        g_periodic_qh_head[i].first_qtd = QTD_LIST_END;
 
-    for (uint32_t i = 0; i < CONFIG_USB_EHCI_FRAME_LIST_SIZE; i++) {
-        g_framelist[bus->hcd.hcd_id][i] = QH_HLP_QH(&g_periodic_qh_head[bus->hcd.hcd_id]);
+        interval = 1 << i;
+        for (uint32_t j = interval - 1; j < CONFIG_USB_EHCI_FRAME_LIST_SIZE; j += interval) {
+            if (g_framelist[j] == 0) {
+                g_framelist[j] = QH_HLP_QH(&g_periodic_qh_head[i]);
+            } else {
+                qh = EHCI_ADDR2QH(g_framelist[j]);
+                while (1) {
+                    if (qh == &g_periodic_qh_head[i]) {
+                        break;
+                    }
+                    if (qh->hw.hlp == QH_HLP_END) {
+                        qh->hw.hlp = QH_HLP_QH(&g_periodic_qh_head[i]);
+                        break;
+                    }
+
+                    qh = EHCI_ADDR2QH(qh->hw.hlp);
+                }
+            }
+        }
     }
 
-#if defined(CONFIG_USB_EHCI_DESC_DCACHE_ENABLE)
-    usb_dcache_clean((uintptr_t)&g_async_qh_head[bus->hcd.hcd_id].hw, CONFIG_USB_EHCI_ALIGN_SIZE);
-    usb_dcache_clean((uintptr_t)&g_periodic_qh_head[bus->hcd.hcd_id].hw, CONFIG_USB_EHCI_ALIGN_SIZE);
-    usb_dcache_clean((uintptr_t)g_framelist[bus->hcd.hcd_id], sizeof(uint32_t) * CONFIG_USB_EHCI_FRAME_LIST_SIZE);
-#endif
+    usb_hc_low_level_init();
 
-    usb_hc_low_level_init(bus);
-
-    USB_LOG_INFO("EHCI HCIVERSION:0x%04x\r\n", (unsigned int)EHCI_HCCR->hciversion);
-    USB_LOG_INFO("EHCI HCSPARAMS:0x%06x\r\n", (unsigned int)EHCI_HCCR->hcsparams);
-    USB_LOG_INFO("EHCI HCCPARAMS:0x%04x\r\n", (unsigned int)EHCI_HCCR->hccparams);
-
-    g_ehci_hcd[bus->hcd.hcd_id].ppc = (EHCI_HCCR->hcsparams & EHCI_HCSPARAMS_PPC) ? true : false;
-    g_ehci_hcd[bus->hcd.hcd_id].n_ports = (EHCI_HCCR->hcsparams & EHCI_HCSPARAMS_NPORTS_MASK) >> EHCI_HCSPARAMS_NPORTS_SHIFT;
-    g_ehci_hcd[bus->hcd.hcd_id].n_cc = (EHCI_HCCR->hcsparams & EHCI_HCSPARAMS_NCC_MASK) >> EHCI_HCSPARAMS_NCC_SHIFT;
-    g_ehci_hcd[bus->hcd.hcd_id].n_pcc = (EHCI_HCCR->hcsparams & EHCI_HCSPARAMS_NPCC_MASK) >> EHCI_HCSPARAMS_NPCC_SHIFT;
-    g_ehci_hcd[bus->hcd.hcd_id].has_tt = g_ehci_hcd[bus->hcd.hcd_id].n_cc ? false : true;
-    g_ehci_hcd[bus->hcd.hcd_id].hcor_offset = EHCI_HCCR->caplength;
-
-    USB_LOG_INFO("EHCI ppc:%u, n_ports:%u, n_cc:%u, n_pcc:%u\r\n",
-                 g_ehci_hcd[bus->hcd.hcd_id].ppc,
-                 g_ehci_hcd[bus->hcd.hcd_id].n_ports,
-                 g_ehci_hcd[bus->hcd.hcd_id].n_cc,
-                 g_ehci_hcd[bus->hcd.hcd_id].n_pcc);
-
-    EHCI_HCOR->usbcmd &= ~EHCI_USBCMD_RUN;
-    usb_osal_msleep(2);
     EHCI_HCOR->usbcmd |= EHCI_USBCMD_HCRESET;
     while (EHCI_HCOR->usbcmd & EHCI_USBCMD_HCRESET) {
         usb_osal_msleep(1);
@@ -857,18 +850,21 @@ int usb_hc_init(struct usbh_bus *bus)
         }
     }
 
+    usb_hc_low_level2_init();
+
     EHCI_HCOR->usbintr = 0;
     EHCI_HCOR->usbsts = EHCI_HCOR->usbsts;
-
-    usb_hc_low_level2_init(bus);
-
+#if CONFIG_USB_EHCI_HCCR_BASE != 0
+    USB_LOG_INFO("EHCI HCIVERSION:%04x\r\n", (int)EHCI_HCCR->hciversion);
+    USB_LOG_INFO("EHCI HCSPARAMS:%06x\r\n", (int)EHCI_HCCR->hcsparams);
+    USB_LOG_INFO("EHCI HCCPARAMS:%04x\r\n", (int)EHCI_HCCR->hccparams);
+#endif
     /* Set the Current Asynchronous List Address. */
-    EHCI_HCOR->asynclistaddr = EHCI_PTR2ADDR(&g_async_qh_head[bus->hcd.hcd_id]);
+    EHCI_HCOR->asynclistaddr = EHCI_PTR2ADDR(&g_async_qh_head);
     /* Set the Periodic Frame List Base Address. */
-    EHCI_HCOR->periodiclistbase = EHCI_PTR2ADDR(g_framelist[bus->hcd.hcd_id]);
+    EHCI_HCOR->periodiclistbase = EHCI_PTR2ADDR(g_framelist);
 
-    regval = EHCI_HCOR->usbcmd;
-    regval &= ~(EHCI_USBCMD_ITHRE_MASK | EHCI_USBCMD_FLSIZE_MASK);
+    regval = 0;
 #if CONFIG_USB_EHCI_FRAME_LIST_SIZE == 1024
     regval |= EHCI_USBCMD_FLSIZE_1024;
 #elif CONFIG_USB_EHCI_FRAME_LIST_SIZE == 512
@@ -879,9 +875,7 @@ int usb_hc_init(struct usbh_bus *bus)
 #error Unsupported frame size list size
 #endif
 
-#if !defined(CONFIG_USB_EHCI_HPMICRO) || !CONFIG_USB_EHCI_HPMICRO
     regval |= EHCI_USBCMD_ITHRE_1MF;
-#endif
     regval |= EHCI_USBCMD_ASEN;
     regval |= EHCI_USBCMD_PSEN;
     regval |= EHCI_USBCMD_RUN;
@@ -899,40 +893,20 @@ int usb_hc_init(struct usbh_bus *bus)
             return -USB_ERR_TIMEOUT;
         }
     }
-
-    if (g_ehci_hcd[bus->hcd.hcd_id].ppc) {
-        for (uint8_t port = 0; port < g_ehci_hcd[bus->hcd.hcd_id].n_ports; port++) {
-            regval = EHCI_HCOR->portsc[port];
-            regval |= EHCI_PORTSC_PP;
-            regval &= ~(EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC);
-            EHCI_HCOR->portsc[port] = regval;
-        }
+#ifdef CONFIG_USB_EHCI_PORT_POWER
+    for (uint8_t port = 0; port < CONFIG_USBHOST_MAX_RHPORTS; port++) {
+        regval = EHCI_HCOR->portsc[port];
+        regval |= EHCI_PORTSC_PP;
+        EHCI_HCOR->portsc[port] = regval;
     }
-
-    if (g_ehci_hcd[bus->hcd.hcd_id].has_tt) {
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-        USB_LOG_INFO("EHCI uses tt for ls/fs device, so cannot enable this macro\r\n");
-        return -USB_ERR_INVAL;
 #endif
-    }
-
-    if (g_ehci_hcd[bus->hcd.hcd_id].has_tt) {
-        USB_LOG_INFO("EHCI uses tt for ls/fs device\r\n");
-    } else {
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-        USB_LOG_INFO("EHCI uses companion controller for ls/fs device\r\n");
-        ohci_init(bus);
-#else
-        USB_LOG_WRN("Do not enable companion controller, you should use a hub to support ls/fs device\r\n");
-#endif
-    }
 
     /* Enable EHCI interrupts. */
     EHCI_HCOR->usbintr = EHCI_USBIE_INT | EHCI_USBIE_ERR | EHCI_USBIE_PCD | EHCI_USBIE_FATAL | EHCI_USBIE_IAA;
     return 0;
 }
 
-int usb_hc_deinit(struct usbh_bus *bus)
+int usb_hc_deinit(void)
 {
     struct ehci_qh_hw *qh;
 
@@ -947,7 +921,7 @@ int usb_hc_deinit(struct usbh_bus *bus)
     regval &= ~EHCI_USBCMD_RUN;
     EHCI_HCOR->usbcmd = regval;
 
-    while ((EHCI_HCOR->usbsts & (EHCI_USBSTS_PSS | EHCI_USBSTS_ASS)) || ((EHCI_HCOR->usbsts & EHCI_USBSTS_HALTED) == 0)) {
+    while ((EHCI_HCOR->usbsts & (EHCI_USBSTS_PSS | EHCI_USBSTS_ASS))) {
         usb_osal_msleep(1);
         timeout++;
         if (timeout > 100) {
@@ -955,71 +929,42 @@ int usb_hc_deinit(struct usbh_bus *bus)
         }
     }
 
-    if (g_ehci_hcd[bus->hcd.hcd_id].ppc) {
-        for (uint8_t port = 0; port < g_ehci_hcd[bus->hcd.hcd_id].n_ports; port++) {
-            regval = EHCI_HCOR->portsc[port];
-            regval &= ~EHCI_PORTSC_PP;
-            EHCI_HCOR->portsc[port] = regval;
-        }
+#ifdef CONFIG_USB_EHCI_PORT_POWER
+    for (uint8_t port = 0; port < CONFIG_USBHOST_MAX_RHPORTS; port++) {
+        regval = EHCI_HCOR->portsc[port];
+        regval &= ~EHCI_PORTSC_PP;
+        EHCI_HCOR->portsc[port] = regval;
     }
+#endif
 
 #ifdef CONFIG_USB_EHCI_CONFIGFLAG
     EHCI_HCOR->configflag = 0;
 #endif
 
     EHCI_HCOR->usbsts = EHCI_HCOR->usbsts;
-    EHCI_HCOR->usbcmd |= EHCI_USBCMD_HCRESET;
 
     for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
-        qh = &ehci_qh_pool[bus->hcd.hcd_id][index];
+        qh = &ehci_qh_pool[index];
         usb_osal_sem_delete(qh->waitsem);
     }
 
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-    ohci_deinit(bus);
-#endif
-
-    usb_hc_low_level_deinit(bus);
     return 0;
 }
 
-uint16_t usbh_get_frame_number(struct usbh_bus *bus)
+uint16_t usbh_get_frame_number(void)
 {
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-    if (EHCI_HCOR->portsc[0] & EHCI_PORTSC_OWNER) {
-        return ohci_get_frame_number(bus);
-    }
-#endif
-
     return (((EHCI_HCOR->frindex & EHCI_FRINDEX_MASK) >> 3) & 0x3ff);
 }
 
-int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup, uint8_t *buf)
+int usbh_roothub_control(struct usb_setup_packet *setup, uint8_t *buf)
 {
     uint8_t nports;
     uint8_t port;
     uint32_t temp, status;
 
-    nports = g_ehci_hcd[bus->hcd.hcd_id].n_ports;
+    nports = CONFIG_USBHOST_MAX_RHPORTS;
 
     port = setup->wIndex;
-
-    temp = EHCI_HCOR->portsc[port - 1];
-
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-    if (temp & EHCI_PORTSC_OWNER) {
-        return ohci_roothub_control(bus, setup, buf);
-    }
-
-    if ((temp & EHCI_PORTSC_LSTATUS_MASK) == EHCI_PORTSC_LSTATUS_KSTATE) {
-        EHCI_HCOR->portsc[port - 1] |= EHCI_PORTSC_OWNER;
-
-        while (!(EHCI_HCOR->portsc[port - 1] & EHCI_PORTSC_OWNER)) {
-        }
-        USB_LOG_INFO("Switch port %u to OHCI\r\n", port);
-        return ohci_roothub_control(bus, setup, buf);
-    }
-#endif
     if (setup->bmRequestType & USB_REQUEST_RECIPIENT_DEVICE) {
         switch (setup->bRequest) {
             case HUB_REQUEST_CLEAR_FEATURE:
@@ -1065,8 +1010,7 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup, u
                         EHCI_HCOR->portsc[port - 1] |= EHCI_PORTSC_RESUME;
                         usb_osal_msleep(20);
                         EHCI_HCOR->portsc[port - 1] &= ~EHCI_PORTSC_RESUME;
-                        while (EHCI_HCOR->portsc[port - 1] & EHCI_PORTSC_RESUME) {
-                        }
+                        while (EHCI_HCOR->portsc[port - 1] & EHCI_PORTSC_RESUME) {}
 
                         temp = EHCI_HCOR->usbcmd;
                         temp |= EHCI_USBCMD_ASEN;
@@ -1074,13 +1018,14 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup, u
                         temp |= EHCI_USBCMD_RUN;
                         EHCI_HCOR->usbcmd = temp;
 
-                        while ((EHCI_HCOR->usbcmd & EHCI_USBCMD_RUN) == 0) {
-                        }
+                        while ((EHCI_HCOR->usbcmd & EHCI_USBCMD_RUN) == 0) {}
 
                     case HUB_PORT_FEATURE_C_SUSPEND:
                         break;
                     case HUB_PORT_FEATURE_POWER:
+#ifdef CONFIG_USB_EHCI_PORT_POWER
                         EHCI_HCOR->portsc[port - 1] &= ~EHCI_PORTSC_PP;
+#endif
                         break;
                     case HUB_PORT_FEATURE_C_CONNECTION:
                         EHCI_HCOR->portsc[port - 1] |= EHCI_PORTSC_CSC;
@@ -1110,29 +1055,18 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup, u
                         temp &= ~EHCI_USBCMD_RUN;
                         EHCI_HCOR->usbcmd = temp;
 
-                        while (EHCI_HCOR->usbcmd & EHCI_USBCMD_RUN) {
-                        }
+                        while (EHCI_HCOR->usbcmd & EHCI_USBCMD_RUN) {}
 
                         EHCI_HCOR->portsc[port - 1] |= EHCI_PORTSC_SUSPEND;
-                        while ((EHCI_HCOR->portsc[port - 1] & EHCI_PORTSC_SUSPEND) == 0) {
-                        }
+                        while ((EHCI_HCOR->portsc[port - 1] & EHCI_PORTSC_SUSPEND) == 0) {}
                         break;
                     case HUB_PORT_FEATURE_POWER:
+#ifdef CONFIG_USB_EHCI_PORT_POWER
                         EHCI_HCOR->portsc[port - 1] |= EHCI_PORTSC_PP;
+#endif
                         break;
                     case HUB_PORT_FEATURE_RESET:
-                        usbh_reset_port(bus, port);
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-                        if (!(EHCI_HCOR->portsc[port - 1] & EHCI_PORTSC_PE)) {
-                            EHCI_HCOR->portsc[port - 1] |= EHCI_PORTSC_OWNER;
-
-                            while (!(EHCI_HCOR->portsc[port - 1] & EHCI_PORTSC_OWNER)) {
-                            }
-
-                            USB_LOG_INFO("Switch port %u to OHCI\r\n", port);
-                            return -USB_ERR_NOTSUPP;
-                        }
-#endif
+                        usbh_reset_port(port);
                         break;
 
                     default:
@@ -1162,9 +1096,9 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup, u
                 if (temp & EHCI_PORTSC_PE) {
                     status |= (1 << HUB_PORT_FEATURE_ENABLE);
 
-                    if (usbh_get_port_speed(bus, port) == USB_SPEED_LOW) {
+                    if (usbh_get_port_speed(port) == USB_SPEED_LOW) {
                         status |= (1 << HUB_PORT_FEATURE_LOWSPEED);
-                    } else if (usbh_get_port_speed(bus, port) == USB_SPEED_HIGH) {
+                    } else if (usbh_get_port_speed(port) == USB_SPEED_HIGH) {
                         status |= (1 << HUB_PORT_FEATURE_HIGHSPEED);
                     }
                 }
@@ -1177,7 +1111,7 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup, u
                 if (temp & EHCI_PORTSC_RESET) {
                     status |= (1 << HUB_PORT_FEATURE_RESET);
                 }
-                if (temp & EHCI_PORTSC_PP || !(EHCI_HCCR->hcsparams & EHCI_HCSPARAMS_PPC)) {
+                if (temp & EHCI_PORTSC_PP) {
                     status |= (1 << HUB_PORT_FEATURE_POWER);
                 }
                 memcpy(buf, &status, 4);
@@ -1196,18 +1130,10 @@ int usbh_submit_urb(struct usbh_urb *urb)
     int ret = 0;
     struct usbh_hub *hub;
     struct usbh_hubport *hport;
-    struct usbh_bus *bus;
 
-    if (!urb || !urb->hport || !urb->ep || !urb->hport->bus) {
+    if (!urb || !urb->hport || !urb->ep) {
         return -USB_ERR_INVAL;
     }
-
-#ifdef CONFIG_USB_DCACHE_ENABLE
-    USB_ASSERT_MSG(!((uintptr_t)urb->setup % CONFIG_USB_ALIGN_SIZE) &&
-                       !((uintptr_t)urb->transfer_buffer % CONFIG_USB_ALIGN_SIZE),
-                   "urb->setup or urb->transfer_buffer is not aligned %d", CONFIG_USB_ALIGN_SIZE);
-#endif
-    bus = urb->hport->bus;
 
     /* find active hubport in roothub */
     hport = urb->hport;
@@ -1217,17 +1143,11 @@ int usbh_submit_urb(struct usbh_urb *urb)
         hub = hub->parent->parent;
     }
 
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-    if (EHCI_HCOR->portsc[hport->port - 1] & EHCI_PORTSC_OWNER) {
-        return ohci_submit_urb(urb);
-    }
-#endif
-
     if (!urb->hport->connected || !(EHCI_HCOR->portsc[hport->port - 1] & EHCI_PORTSC_CCS)) {
         return -USB_ERR_NOTCONN;
     }
 
-    if (urb->errorcode == -USB_ERR_BUSY) {
+    if ((urb->errorcode == -USB_ERR_BUSY) && (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) != USB_ENDPOINT_TYPE_ISOCHRONOUS)) {
         return -USB_ERR_BUSY;
     }
 
@@ -1241,26 +1161,29 @@ int usbh_submit_urb(struct usbh_urb *urb)
 
     switch (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes)) {
         case USB_ENDPOINT_TYPE_CONTROL:
-            qh = ehci_control_urb_init(bus, urb, urb->setup, urb->transfer_buffer, urb->transfer_buffer_length);
+            qh = ehci_control_urb_init(urb, urb->setup, urb->transfer_buffer, urb->transfer_buffer_length);
             if (qh == NULL) {
                 return -USB_ERR_NOMEM;
             }
+            urb->hcpriv = qh;
             break;
         case USB_ENDPOINT_TYPE_BULK:
-            qh = ehci_bulk_urb_init(bus, urb, urb->transfer_buffer, urb->transfer_buffer_length);
+            qh = ehci_bulk_urb_init(urb, urb->transfer_buffer, urb->transfer_buffer_length);
             if (qh == NULL) {
                 return -USB_ERR_NOMEM;
             }
+            urb->hcpriv = qh;
             break;
         case USB_ENDPOINT_TYPE_INTERRUPT:
-            qh = ehci_intr_urb_init(bus, urb, urb->transfer_buffer, urb->transfer_buffer_length);
+            qh = ehci_intr_urb_init(urb, urb->transfer_buffer, urb->transfer_buffer_length);
             if (qh == NULL) {
                 return -USB_ERR_NOMEM;
             }
+            urb->hcpriv = qh;
             break;
         case USB_ENDPOINT_TYPE_ISOCHRONOUS:
 #ifdef CONFIG_USB_EHCI_ISO
-            ret = ehci_iso_urb_init(bus, urb);
+            ret = ehci_iso_urb_init(urb);
 #endif
             break;
         default:
@@ -1276,7 +1199,7 @@ int usbh_submit_urb(struct usbh_urb *urb)
         urb->timeout = 0;
         ret = urb->errorcode;
         /* we can free qh when waitsem is done */
-        ehci_qh_free(bus, qh);
+        ehci_qh_free(qh);
     }
     return ret;
 errout_timeout:
@@ -1288,46 +1211,39 @@ errout_timeout:
 int usbh_kill_urb(struct usbh_urb *urb)
 {
     struct ehci_qh_hw *qh;
-    struct usbh_bus *bus;
     size_t flags;
-    bool remove_in_iaad = false;
 
-    if (!urb || !urb->hport || !urb->hcpriv || !urb->hport->bus) {
+    if (!urb || !urb->hcpriv) {
         return -USB_ERR_INVAL;
     }
-
-    bus = urb->hport->bus;
-
-#ifdef CONFIG_USB_EHCI_WITH_OHCI
-    if (EHCI_HCOR->portsc[urb->hport->port - 1] & EHCI_PORTSC_OWNER) {
-        return ohci_kill_urb(urb);
-    }
-#endif
 
     flags = usb_osal_enter_critical_section();
 
     EHCI_HCOR->usbcmd &= ~(EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
 
     if ((USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_CONTROL) || (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK)) {
-        qh = EHCI_ADDR2QH(g_async_qh_head[bus->hcd.hcd_id].hw.hlp);
-        while ((qh != &g_async_qh_head[bus->hcd.hcd_id]) && qh) {
+        qh = EHCI_ADDR2QH(g_async_qh_head.hw.hlp);
+        while ((qh != &g_async_qh_head) && qh) {
             if (qh->urb == urb) {
-                remove_in_iaad = true;
-                ehci_kill_qh(bus, &g_async_qh_head[bus->hcd.hcd_id], qh);
+                ehci_kill_qh(&g_async_qh_head, qh);
             }
             qh = EHCI_ADDR2QH(qh->hw.hlp);
         }
     } else if (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT) {
-        qh = EHCI_ADDR2QH(g_periodic_qh_head[bus->hcd.hcd_id].hw.hlp);
+        qh = EHCI_ADDR2QH(g_periodic_qh_head[EHCI_PERIOIDIC_QH_NUM - 1].hw.hlp);
         while (qh) {
             if (qh->urb == urb) {
-                ehci_kill_qh(bus, &g_periodic_qh_head[bus->hcd.hcd_id], qh);
+                if (urb->hport->speed == USB_SPEED_HIGH) {
+                    ehci_kill_qh(ehci_get_periodic_qhead(urb->ep->bInterval), qh);
+                } else {
+                    ehci_kill_qh(ehci_get_periodic_qhead(urb->ep->bInterval * 8), qh);
+                }
             }
             qh = EHCI_ADDR2QH(qh->hw.hlp);
         }
     } else {
 #ifdef CONFIG_USB_EHCI_ISO
-        ehci_kill_iso_urb(bus, urb);
+        ehci_remove_itd_urb(urb);
         EHCI_HCOR->usbcmd |= (EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
         usb_osal_leave_critical_section(flags);
         return 0;
@@ -1337,30 +1253,15 @@ int usbh_kill_urb(struct usbh_urb *urb)
     EHCI_HCOR->usbcmd |= (EHCI_USBCMD_PSEN | EHCI_USBCMD_ASEN);
 
     qh = (struct ehci_qh_hw *)urb->hcpriv;
-    urb->errorcode = -USB_ERR_SHUTDOWN;
+    urb->hcpriv = NULL;
+    qh->urb = NULL;
 
     if (urb->timeout) {
+        urb->timeout = 0;
+        urb->errorcode = -USB_ERR_SHUTDOWN;
         usb_osal_sem_give(qh->waitsem);
     } else {
-        ehci_qh_free(bus, qh);
-    }
-
-    if (remove_in_iaad) {
-        volatile uint32_t timeout = 0;
-        EHCI_HCOR->usbcmd |= EHCI_USBCMD_IAAD;
-        while (!(EHCI_HCOR->usbsts & EHCI_USBSTS_IAA)) {
-            timeout++;
-            if (timeout > 200000) {
-                USB_LOG_ERR("iaad timeout\r\n");
-                usb_osal_leave_critical_section(flags);
-                return -USB_ERR_TIMEOUT;
-            }
-        }
-        EHCI_HCOR->usbsts = EHCI_USBSTS_IAA;
-    }
-
-    if (urb->complete) {
-        urb->complete(urb->arg, urb->errorcode);
+        ehci_qh_free(qh);
     }
 
     usb_osal_leave_critical_section(flags);
@@ -1368,82 +1269,87 @@ int usbh_kill_urb(struct usbh_urb *urb)
     return 0;
 }
 
-static void ehci_scan_async_list(struct usbh_bus *bus)
+static void ehci_scan_async_list(void)
 {
     struct ehci_qh_hw *qh;
 
-    qh = EHCI_ADDR2QH(g_async_qh_head[bus->hcd.hcd_id].hw.hlp);
-    while ((qh != &g_async_qh_head[bus->hcd.hcd_id]) && qh) {
+    qh = EHCI_ADDR2QH(g_async_qh_head.hw.hlp);
+    while ((qh != &g_async_qh_head) && qh) {
         if (qh->urb) {
-            ehci_check_qh(bus, &g_async_qh_head[bus->hcd.hcd_id], qh);
+            ehci_check_qh(&g_async_qh_head, qh);
         }
         qh = EHCI_ADDR2QH(qh->hw.hlp);
     }
 }
 
-static void ehci_scan_periodic_list(struct usbh_bus *bus)
+static void ehci_scan_periodic_list(void)
 {
     struct ehci_qh_hw *qh;
 
-    qh = EHCI_ADDR2QH(g_periodic_qh_head[bus->hcd.hcd_id].hw.hlp);
+    qh = EHCI_ADDR2QH(g_periodic_qh_head[EHCI_PERIOIDIC_QH_NUM - 1].hw.hlp);
     while (qh) {
         if (qh->urb) {
-            ehci_check_qh(bus, &g_periodic_qh_head[bus->hcd.hcd_id], qh);
+            if (qh->urb->hport->speed == USB_SPEED_HIGH) {
+                ehci_check_qh(ehci_get_periodic_qhead(qh->urb->ep->bInterval), qh);
+            } else {
+                ehci_check_qh(ehci_get_periodic_qhead(qh->urb->ep->bInterval * 8), qh);
+            }
         }
         qh = EHCI_ADDR2QH(qh->hw.hlp);
     }
 }
 
-void USBH_IRQHandler(uint8_t busid)
+void USBH_IRQHandler(void)
 {
     uint32_t usbsts;
-    struct usbh_bus *bus;
-
-    bus = &g_usbhost_bus[busid];
 
     usbsts = EHCI_HCOR->usbsts & EHCI_HCOR->usbintr;
     EHCI_HCOR->usbsts = usbsts;
 
     if (usbsts & EHCI_USBSTS_INT) {
-        ehci_scan_async_list(bus);
-        ehci_scan_periodic_list(bus);
+        ehci_scan_async_list();
+        ehci_scan_periodic_list();
 #ifdef CONFIG_USB_EHCI_ISO
-        ehci_scan_isochronous_list(bus);
+        ehci_scan_isochronous_list();
 #endif
     }
 
     if (usbsts & EHCI_USBSTS_ERR) {
-        ehci_scan_async_list(bus);
-        ehci_scan_periodic_list(bus);
+        ehci_scan_async_list();
+        ehci_scan_periodic_list();
 #ifdef CONFIG_USB_EHCI_ISO
-        ehci_scan_isochronous_list(bus);
+        ehci_scan_isochronous_list();
 #endif
     }
 
     if (usbsts & EHCI_USBSTS_PCD) {
-        for (int port = 0; port < g_ehci_hcd[bus->hcd.hcd_id].n_ports; port++) {
+        for (int port = 0; port < CONFIG_USBHOST_MAX_RHPORTS; port++) {
             uint32_t portsc = EHCI_HCOR->portsc[port];
 
             if (portsc & EHCI_PORTSC_CSC) {
                 if ((portsc & EHCI_PORTSC_CCS) == EHCI_PORTSC_CCS) {
                 } else {
-#if defined(CONFIG_USB_EHCI_NXP)
-                    /* kUSB_ControllerEhci0 and kUSB_ControllerEhci1*/
-                    extern void USB_EhcihostPhyDisconnectDetectCmd(uint8_t controllerId, uint8_t enable);
-                    USB_EhcihostPhyDisconnectDetectCmd(2 + busid, 0);
-#endif
+                    for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
+                        g_ehci_hcd.ehci_qh_used[index] = false;
+                    }
+                    for (uint8_t index = 0; index < CONFIG_USB_EHCI_QTD_NUM; index++) {
+                        g_ehci_hcd.ehci_qtd_used[index] = false;
+                    }
+                    for (uint8_t index = 0; index < CONFIG_USB_EHCI_ITD_NUM; index++) {
+                        g_ehci_hcd.ehci_itd_used[index] = false;
+                    }
                 }
-                bus->hcd.roothub.int_buffer[0] |= (1 << (port + 1));
-                usbh_hub_thread_wakeup(&bus->hcd.roothub);
+
+                usbh_roothub_thread_wakeup(port + 1);
             }
         }
     }
 
     if (usbsts & EHCI_USBSTS_IAA) {
         for (uint8_t index = 0; index < CONFIG_USB_EHCI_QH_NUM; index++) {
-            struct ehci_qh_hw *qh = &ehci_qh_pool[bus->hcd.hcd_id][index];
-            if (qh->remove_in_iaad) {
-                ehci_urb_waitup(bus, qh->urb);
+            struct ehci_qh_hw *qh = &ehci_qh_pool[index];
+            if (g_ehci_hcd.ehci_qh_used[index] && qh->remove_in_iaad) {
+                ehci_urb_waitup(qh->urb);
             }
         }
     }
